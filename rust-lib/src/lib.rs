@@ -6,6 +6,7 @@ pub mod jobs;
 pub mod keys;
 pub mod net;
 pub mod network;
+pub mod send;
 pub mod storage;
 pub mod sync;
 pub mod wallet;

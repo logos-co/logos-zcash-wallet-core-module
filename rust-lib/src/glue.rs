@@ -16,8 +16,9 @@ use crate::gate::{Caller, Callers};
 pub trait ZcashWalletCoreModule: Send + Sync + 'static {
     /// `{ ok, version, crates }`.
     fn version(&self) -> String;
-    /// Starts `create_wallet`, `restore_wallet`, `open_wallet`, `close_wallet` or
-    /// `change_password`. `params` is a JSON object. `{ ok, jobId, receipt }`.
+    /// Starts `create_wallet`, `restore_wallet`, `open_wallet`, `close_wallet`,
+    /// `change_password`, `propose` (`{ send }`) or `sign_and_send` (`{ proposalId,
+    /// password }`). `params` is a JSON object. `{ ok, jobId, receipt }`.
     fn start_job(&self, kind: String, params: String) -> String;
     /// `{ ok, jobId, kind, state: queued|running|done|failed|cancelled, error }`.
     fn job_status(&self, job_id: String, receipt: String) -> String;
@@ -170,7 +171,11 @@ impl ZcashWalletCoreModule for ZcashWalletCoreModuleImpl {
             Event::BalanceChanged(v) => emit_balance_changed(&v.to_string()),
             Event::JobFinished { id, state } => emit_job_finished(&id, state),
         });
-        let _ = self.engine.set(Engine::new(dir.join("wallets"), sink, None));
+        // Sapling parameters ship beside the plugin; ZCASH_PARAMS_DIR overrides for development.
+        let params = std::env::var_os("ZCASH_PARAMS_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| Some(std::path::PathBuf::from(&ctx.module_path).join("params")));
+        let _ = self.engine.set(Engine::new(dir.join("wallets"), sink, None, params));
     }
 }
 

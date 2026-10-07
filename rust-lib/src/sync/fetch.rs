@@ -61,3 +61,15 @@ pub async fn tree_state(server: &str, proxy: &ProxyAddr, height: u32) -> Result<
     let mut c = connect(server, proxy, Isolation::fresh()).await?;
     Ok(c.get_tree_state(BlockId { height: height as u64, hash: vec![] }).await.map_err(status(server))?.into_inner())
 }
+
+/// Broadcasts on a fresh circuit. Returns lightwalletd's error code and message;
+/// code 0 means the node accepted it.
+pub async fn send_transaction(server: &str, proxy: &ProxyAddr, raw: Vec<u8>) -> Result<(i32, String), NetError> {
+    let mut c = connect(server, proxy, Isolation::fresh()).await?;
+    let r = c
+        .send_transaction(zcash_client_backend::proto::service::RawTransaction { data: raw, height: 0 })
+        .await
+        .map_err(status(server))?
+        .into_inner();
+    Ok((r.error_code, r.error_message))
+}

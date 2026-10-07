@@ -3937,6 +3937,7 @@ version = "0.1.0"
 dependencies = [
  "age",
  "bip0039",
+ "blake2b_simd",
  "futures-util",
  "hex",
  "http",

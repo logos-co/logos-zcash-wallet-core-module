@@ -61,6 +61,8 @@ enum Task {
     Restore { network: ZNetwork, name: String, password: Zeroizing<String>, phrase: Phrase, birthday: u32, routes: Routes },
     Open { network: ZNetwork, name: String, password: Zeroizing<String>, routes: Routes },
     Close,
+    Propose { input: crate::send::SendInput },
+    SignAndSend { proposal: String, password: Zeroizing<String> },
     ChangePassword { network: ZNetwork, name: String, old: Zeroizing<String>, new: Zeroizing<String> },
 }
 
@@ -75,6 +77,8 @@ struct Params {
     phrase: Option<String>,
     birthday_height: Option<u32>,
     routes: Option<Routes>,
+    send: Option<crate::send::SendInput>,
+    proposal_id: Option<String>,
 }
 
 impl Drop for Params {
@@ -122,6 +126,11 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
             routes: p.routes.clone().ok_or("routes are required")?,
         },
         "close_wallet" => Task::Close,
+        "propose" => Task::Propose { input: p.send.clone().ok_or("send is required")? },
+        "sign_and_send" => Task::SignAndSend {
+            proposal: p.proposal_id.clone().ok_or("proposalId is required")?,
+            password: take(&mut p.password, "password")?,
+        },
         "change_password" => Task::ChangePassword {
             network: network()?,
             name: name(&p)?,
@@ -134,6 +143,8 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
 
 enum WalletCmd {
     NewAddress(Sender<Result<Value, String>>),
+    Propose(crate::send::SendInput, Sender<Result<Value, String>>),
+    Sign(String, Phrase, Arc<zcash_proofs::prover::LocalTxProver>, Sender<Result<Vec<(String, Vec<u8>)>, String>>),
 }
 
 struct OpenWallet {
@@ -146,6 +157,7 @@ struct OpenWallet {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     progress: Arc<Mutex<Progress>>,
+    routes: Routes,
 }
 
 impl OpenWallet {
@@ -173,10 +185,12 @@ pub struct Engine {
     worker: Mutex<Option<JoinHandle<()>>>,
     /// age's scrypt work factor; only tests lower it.
     work_factor: Option<u8>,
+    params_dir: Option<PathBuf>,
+    prover: Mutex<Option<Arc<zcash_proofs::prover::LocalTxProver>>>,
 }
 
 impl Engine {
-    pub fn new(root: PathBuf, sink: Sink, work_factor: Option<u8>) -> Arc<Self> {
+    pub fn new(root: PathBuf, sink: Sink, work_factor: Option<u8>, params_dir: Option<PathBuf>) -> Arc<Self> {
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -194,6 +208,8 @@ impl Engine {
             sink,
             worker: Mutex::new(None),
             work_factor,
+            params_dir,
+            prover: Mutex::new(None),
         });
         let e = Arc::downgrade(&engine);
         let q = engine.queue.clone();
@@ -247,6 +263,8 @@ impl Engine {
             }
             Task::Open { network, name, password, routes } => self.open_wallet(network, &name, &password, &routes),
             Task::Close => Ok(self.close()),
+            Task::Propose { input } => self.propose(input),
+            Task::SignAndSend { proposal, password } => self.sign_and_send(&proposal, &password),
             Task::ChangePassword { network, name, old, new } => WalletDir::new(&self.root, network, &name)
                 .change_password(&old, &new, self.work_factor)
                 .map(|_| json!({"name": name}))
@@ -328,6 +346,7 @@ impl Engine {
             stop,
             thread: Some(thread),
             progress,
+            routes: routes.clone(),
         });
         (self.sink)(Event::WalletState(self.wallet_status()));
         Ok(result)
@@ -354,6 +373,56 @@ impl Engine {
         if let Some(h) = self.worker.lock().unwrap().take() {
             let _ = h.join();
         }
+    }
+
+    fn ask<T>(&self, make: impl FnOnce(Sender<Result<T, String>>) -> WalletCmd, wait: Duration) -> Result<T, String> {
+        let rx = self.with_open(|w| {
+            let (tx, rx) = channel();
+            w.cmd.send(make(tx)).map_err(|_| "wallet is closing".to_string())?;
+            Ok(rx)
+        })?;
+        rx.recv_timeout(wait).map_err(|_| "the wallet did not answer".to_string())?
+    }
+
+    fn propose(&self, input: crate::send::SendInput) -> Result<Value, String> {
+        self.ask(|tx| WalletCmd::Propose(input, tx), Duration::from_secs(60))
+    }
+
+    fn prover(&self) -> Result<Arc<zcash_proofs::prover::LocalTxProver>, String> {
+        let mut g = self.prover.lock().unwrap();
+        if let Some(p) = g.as_ref() {
+            return Ok(p.clone());
+        }
+        let dir = self.params_dir.clone().ok_or("no Sapling parameter directory is configured")?;
+        let p = Arc::new(crate::send::load_prover(&dir)?);
+        *g = Some(p.clone());
+        Ok(p)
+    }
+
+    /// Decrypts the seed, has the wallet thread prove and sign, then broadcasts each
+    /// transaction on a fresh circuit, trying the servers in order.
+    fn sign_and_send(&self, proposal: &str, password: &str) -> Result<Value, String> {
+        let (dir, routes) = self.with_open(|w| Ok((WalletDir { path: w.dir.path.clone() }, w.routes.clone())))?;
+        let phrase = dir.unseal_phrase(password).map_err(|e| e.to_string())?;
+        let prover = self.prover()?;
+        let built = self.ask(|tx| WalletCmd::Sign(proposal.to_string(), phrase, prover, tx), Duration::from_secs(300))?;
+        let cfg = routes.config()?;
+        let mut sent = vec![];
+        for (txid, raw) in built {
+            let mut outcome = json!({"txid": txid, "accepted": false});
+            for server in &cfg.servers {
+                match self.rt.block_on(fetch::send_transaction(server, &cfg.proxy, raw.clone())) {
+                    Ok((0, _)) => {
+                        outcome = json!({"txid": txid, "accepted": true, "server": server});
+                        break;
+                    }
+                    Ok((code, msg)) => outcome = json!({"txid": txid, "accepted": false, "server": server, "error": format!("{code}: {msg}")}),
+                    Err(e) => outcome = json!({"txid": txid, "accepted": false, "server": server, "error": e.to_string()}),
+                }
+            }
+            sent.push(outcome);
+        }
+        Ok(json!({"transactions": sent}))
     }
 
     pub fn list_wallets(&self, network: &str) -> Value {
@@ -517,7 +586,11 @@ fn wallet_loop(
     let mut last_emit = Instant::now() - Duration::from_secs(60);
     let mut last_balance: Option<Value> = None;
     let mut last_balance_check = Instant::now() - Duration::from_secs(60);
+    let mut prepared: std::collections::HashMap<String, crate::send::Prepared> = Default::default();
+    let mut next_proposal = 0u64;
+    let params = *db.params();
     while !stop.load(Ordering::SeqCst) {
+        prepared.retain(|_, p| p.created.elapsed().as_secs() <= crate::send::PREVIEW_TTL_SECS);
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 WalletCmd::NewAddress(reply) => {
@@ -526,6 +599,26 @@ fn wallet_loop(
                         .map_err(|e| e.to_string())
                         .and_then(|o| o.ok_or_else(|| "account missing".to_string()))
                         .map(|(ua, _)| json!({"ok": true, "unified": ua.encode(db.params())}));
+                    let _ = reply.send(r);
+                }
+                WalletCmd::Propose(input, reply) => {
+                    let r = crate::send::propose(&mut db, params, account, &input).and_then(|proposal| {
+                        let expiry = crate::send::expiry_for(&params, proposal.min_target_height().into())?;
+                        let preview = crate::send::preview(&params, &proposal, expiry);
+                        next_proposal += 1;
+                        let id = format!("p{next_proposal}");
+                        prepared.insert(id.clone(), crate::send::Prepared { created: Instant::now(), proposal, expiry, preview: preview.clone() });
+                        Ok(json!({"proposalId": id, "preview": preview}))
+                    });
+                    let _ = reply.send(r);
+                }
+                WalletCmd::Sign(id, phrase, prover, reply) => {
+                    let r = match prepared.remove(&id) {
+                        None => Err("unknown or expired proposal".to_string()),
+                        Some(p) => crate::send::sign(&mut db, params, account, &p, &phrase, &prover)
+                            .map(|v| v.into_iter().map(|(txid, raw)| (txid.to_string(), raw)).collect()),
+                    };
+                    drop(phrase);
                     let _ = reply.send(r);
                 }
             }
