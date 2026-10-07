@@ -1,22 +1,24 @@
 //! The sync driver. It runs on the wallet thread, one bounded step at a time, so
 //! commands and cancellation are handled between steps.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::TryStreamExt;
 use serde::Serialize;
 use zcash_client_backend::data_api::chain::{error::Error as ChainError, scan_cached_blocks, ChainState, CommitmentTreeRoot};
 use zcash_client_backend::data_api::scanning::ScanPriority;
-use zcash_client_backend::data_api::{WalletCommitmentTrees, WalletRead, WalletWrite};
+use zcash_client_backend::data_api::wallet::decrypt_and_store_transaction;
+use zcash_client_backend::data_api::{TransactionDataRequest, WalletCommitmentTrees, WalletRead, WalletWrite};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::{GetSubtreeRootsArg, LightdInfo, ShieldedProtocol};
 use zcash_primitives::merkle_tree::HashSer;
 use zcash_protocol::consensus::BlockHeight;
 
 use super::cache::{grid_floor, BlockCache, GRID};
+use super::enhance::{self, Fetched};
 use super::fetch::{self, Chunk};
 use super::frontier::{self, FrontierError};
 use crate::net::client::{connect, NetError};
@@ -73,6 +75,7 @@ pub struct Progress {
     pub blocks_scanned: u64,
     pub outputs_scanned: u64,
     pub downloads_in_flight: usize,
+    pub details_pending: usize,
     pub chunks_cached: usize,
     pub last_error: Option<String>,
 }
@@ -91,6 +94,7 @@ enum Msg {
     Chunk(u32, Result<Chunk, NetError>),
     Head(u32, Result<Vec<CompactBlock>, NetError>),
     Tip(Result<(u32, LightdInfo), NetError>),
+    Enhanced(TransactionDataRequest, Result<Fetched, NetError>),
 }
 
 pub struct Syncer {
@@ -109,6 +113,8 @@ pub struct Syncer {
     next_server: usize,
     /// The chain state after the last scan call, to continue mid-chunk cheaply.
     last_end: Option<ChainState>,
+    enh_in_flight: HashSet<TransactionDataRequest>,
+    last_enh: Option<Instant>,
     pub progress: Progress,
 }
 
@@ -134,6 +140,8 @@ impl Syncer {
             roots_loaded: false,
             next_server: 0,
             last_end: None,
+            enh_in_flight: HashSet::new(),
+            last_enh: None,
             progress: Progress { state: "starting".into(), birthday, ..Default::default() },
         }
     }
@@ -173,6 +181,7 @@ impl Syncer {
             self.progress.state = "scanning".into();
             return Ok(Step::Worked);
         }
+        self.plan_enhancements(db, tip)?;
         let synced = self.progress.fully_scanned.is_some_and(|h| h >= tip) && self.in_flight.is_empty();
         self.progress.state = if synced { "synced" } else { "downloading" }.into();
         Ok(if synced { Step::Synced } else { Step::Waiting })
@@ -211,6 +220,13 @@ impl Syncer {
                 self.in_flight.remove(&start);
                 match r {
                     Ok(chunk) => self.store_chunk(chunk)?,
+                    Err(e) => self.progress.last_error = Some(e.to_string()),
+                }
+            }
+            Msg::Enhanced(req, r) => {
+                self.enh_in_flight.remove(&req);
+                match r {
+                    Ok(fetched) => self.apply_enhancement(db, req, fetched)?,
                     Err(e) => self.progress.last_error = Some(e.to_string()),
                 }
             }
@@ -360,6 +376,50 @@ impl Syncer {
         Ok(())
     }
 
+    /// Sends out what the wallet asks to learn, a few at a time.
+    fn plan_enhancements(&mut self, db: &Db, tip: u32) -> Result<(), SyncError> {
+        if self.last_enh.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+            return Ok(());
+        }
+        self.last_enh = Some(Instant::now());
+        let requests = db.transaction_data_requests().map_err(db_err)?;
+        self.progress.details_pending = requests.len();
+        let now = SystemTime::now();
+        for req in requests {
+            if self.enh_in_flight.len() >= 4 {
+                break;
+            }
+            if self.enh_in_flight.contains(&req) || enhance::not_before(&req).is_some_and(|t| t > now) {
+                continue;
+            }
+            self.enh_in_flight.insert(req.clone());
+            let server = enhance::pick(&self.cfg.servers).to_string();
+            let (proxy, tx, params) = (self.cfg.proxy.clone(), self.tx.clone(), self.params);
+            self.rt.spawn(async move {
+                tokio::time::sleep(enhance::random_delay()).await;
+                let r = enhance::fetch(params, &server, &proxy, &req, tip).await;
+                let _ = tx.send(Msg::Enhanced(req, r));
+            });
+        }
+        Ok(())
+    }
+
+    fn apply_enhancement(&mut self, db: &mut Db, req: TransactionDataRequest, fetched: Fetched) -> Result<(), SyncError> {
+        match fetched {
+            Fetched::Status(txid, status) => db.set_transaction_status(txid, status).map_err(db_err)?,
+            Fetched::Txs(txs) => {
+                for (tx, height) in &txs {
+                    decrypt_and_store_transaction(&self.params, db, tx, *height).map_err(db_err)?;
+                }
+                if let TransactionDataRequest::TransactionsInvolvingAddress(r) = req {
+                    let as_of = r.block_range_end().map(|e| e - 1).unwrap_or(BlockHeight::from(self.tip.unwrap_or(0)));
+                    db.notify_address_checked(r, as_of).map_err(db_err)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The chain state just below `start`, from the grid tree state and cached blocks.
     fn state_before(&self, start: u32) -> Result<Option<ChainState>, SyncError> {
         if let Some(s) = &self.last_end {
@@ -398,7 +458,9 @@ impl Syncer {
                     let avail = self.cache.contiguous_end(ws)?.min(re).min(c + GRID);
                     if avail > ws {
                         if let Some(state) = self.state_before(ws)? {
-                            return self.scan_window(db, ws, avail, state).map(|_| true);
+                            self.scan_window(db, ws, avail, state)?;
+                            self.prune_chunk(db, c, tip)?;
+                            return Ok(true);
                         }
                     }
                 }
@@ -409,6 +471,23 @@ impl Syncer {
             }
         }
         Ok(false)
+    }
+
+    /// Drops a chunk's blocks once nothing in it is left to scan, outside the head.
+    fn prune_chunk(&mut self, db: &Db, start: u32, tip: u32) -> Result<(), SyncError> {
+        let end = start + GRID;
+        if end + HEAD > tip {
+            return Ok(());
+        }
+        let open = db.suggest_scan_ranges().map_err(db_err)?.into_iter().any(|r| {
+            !matches!(r.priority(), ScanPriority::Scanned | ScanPriority::Ignored)
+                && u32::from(r.block_range().start) < end
+                && u32::from(r.block_range().end) > start
+        });
+        if !open {
+            self.cache.forget_chunk(start)?;
+        }
+        Ok(())
     }
 
     fn scan_window(&mut self, db: &mut Db, start: u32, end: u32, state: ChainState) -> Result<(), SyncError> {

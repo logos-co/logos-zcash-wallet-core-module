@@ -140,6 +140,14 @@ impl BlockCache {
         Ok(())
     }
 
+    /// Drops a scanned chunk's blocks and its record; its tree state stays.
+    pub fn forget_chunk(&self, start: u32) -> Result<(), CacheError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM blocks WHERE height >= ?1 AND height < ?2", params![start, start + GRID])?;
+        conn.execute("DELETE FROM chunks WHERE start = ?1", [start])?;
+        Ok(())
+    }
+
     /// Forgets everything at or above `height`, after a reorg.
     pub fn truncate_from(&self, height: u32) -> Result<(), CacheError> {
         let conn = self.conn.lock().unwrap();

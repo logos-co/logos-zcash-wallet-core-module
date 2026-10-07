@@ -3,4 +3,5 @@
 pub mod cache;
 pub mod frontier;
 pub mod driver;
+pub mod enhance;
 pub mod fetch;
