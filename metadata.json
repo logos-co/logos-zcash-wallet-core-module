@@ -1,0 +1,27 @@
+{
+  "name": "zcash_wallet_core_module",
+  "display_name": "Zcash Wallet Core",
+  "version": "0.1.0",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "wallet",
+  "description": "Zcash wallet engine: librustzcash light client with keys sealed at rest, a SQLCipher database, and sync over Tor on a fixed download grid. Answers only zcash_wallet_backend.",
+  "author": "Logos Core Team",
+  "main": "zcash_wallet_core_module_plugin",
+  "dependencies": [],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "ZcashWalletCoreModule", "source": "src/glue.rs" }
+  },
+  "nix": {
+    "rust": {
+      "toolchain": "1.96.0",
+      "packages": { "build": ["pkg-config", "perl"], "runtime": [] }
+    },
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}

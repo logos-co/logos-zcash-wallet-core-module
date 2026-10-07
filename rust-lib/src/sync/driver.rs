@@ -62,7 +62,7 @@ pub enum SyncError {
     Misbehaving { server: String, detail: String },
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Progress {
     pub state: String,

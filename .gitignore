@@ -1,3 +1,4 @@
 target/
 /logos-rust-sdk-src
 /result*
+rust-lib/generated/

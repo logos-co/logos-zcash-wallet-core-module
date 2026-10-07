@@ -1,11 +1,17 @@
 //! Zcash wallet engine for Logos.
 
+pub mod engine;
+pub mod gate;
+pub mod jobs;
 pub mod keys;
 pub mod net;
 pub mod network;
 pub mod storage;
 pub mod sync;
 pub mod wallet;
+
+#[cfg(feature = "logos_module")]
+mod glue;
 
 #[cfg(test)]
 mod smoke {
