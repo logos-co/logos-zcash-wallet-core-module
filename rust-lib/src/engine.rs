@@ -400,9 +400,18 @@ impl Engine {
                 .get_last_generated_address_matching(w.account, UnifiedAddressRequest::SHIELDED)
                 .map_err(|e| e.to_string())?;
             let transparent = first_external_transparent(&db, w.account)?;
-            Ok(json!({"ok": true, "unified": ua.map(|a| a.encode(&w.network)), "transparent": transparent}))
+            Ok((ua.map(|a| a.encode(&w.network)), transparent))
         });
-        r.unwrap_or_else(|e| json!({"ok": false, "error": e}))
+        match r {
+            // The account's first address may carry a transparent receiver; the
+            // shielded-only one is made on first use.
+            Ok((None, transparent)) => {
+                let made = self.new_address();
+                json!({"ok": made["ok"], "unified": made["unified"], "transparent": transparent, "error": made.get("error")})
+            }
+            Ok((unified, transparent)) => json!({"ok": true, "unified": unified, "transparent": transparent}),
+            Err(e) => json!({"ok": false, "error": e}),
+        }
     }
 
     pub fn new_address(&self) -> Value {
