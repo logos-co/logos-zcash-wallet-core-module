@@ -3,6 +3,7 @@
 pub mod keys;
 pub mod net;
 pub mod storage;
+pub mod sync;
 
 #[cfg(test)]
 mod smoke {
