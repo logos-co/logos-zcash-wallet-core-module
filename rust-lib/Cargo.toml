@@ -1,0 +1,76 @@
+[package]
+name = "zcash_wallet_core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+
+# Standalone crate: keeps cargo from adopting a workspace in a parent directory.
+[workspace]
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# The librustzcash pre-release cohort pins its members exactly; move them together.
+[dependencies]
+zcash_client_backend = { version = "=0.25.0-pre.1", default-features = false, features = [
+    "orchard",
+    "transparent-inputs",
+    "pczt",
+    "zeroize",
+    "lightwalletd-tonic-transport",
+    "lightwalletd-tonic-tls-webpki-roots",
+] }
+zcash_client_sqlite = { version = "=0.23.0-pre.1", features = ["orchard", "transparent-inputs"] }
+zcash_keys = { version = "=0.17.0-pre.1", features = ["orchard", "transparent-inputs"] }
+zcash_protocol = "=0.11.0-pre.0"
+zcash_primitives = "=0.31.0-pre.1"
+zcash_proofs = { version = "=0.31.0-pre.1", default-features = false, features = ["local-prover", "multicore"] }
+zcash_pool_migration = { version = "=0.2.0-pre.1", features = ["wallet"] }
+zcash_address = "=0.14.0-pre.1"
+zcash_transparent = "=0.11.0-pre.1"
+zip321 = "=0.10.0-pre.1"
+pczt = "=0.10.0-pre.1"
+zip32 = "0.3"
+
+# Storage: the same rusqlite as zcash_client_sqlite, switched to SQLCipher for the whole graph.
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
+
+# Keys at rest.
+age = { version = "0.11", default-features = false }
+bip0039 = { version = "0.12", features = ["std", "all-languages"] }
+secrecy = "0.8"
+zeroize = "1"
+
+# Network: gRPC over a socks5h connector.
+tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring", "tls-webpki-roots", "codegen"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-socks = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
+http = "1"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+rand = "0.10"
+rand_chacha = "0.10"
+thiserror = "2"
+tracing = "0.1"
+
+# Provided by logos-module-builder at build time (staged into ../logos-rust-sdk-src).
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+# Apple uses CommonCrypto for SQLCipher; elsewhere OpenSSL is vendored.
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["logos_module"]
+logos_module = ["dep:logos-rust-sdk"]
+
+[profile.release]
+panic = "unwind"
