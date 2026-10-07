@@ -3959,6 +3959,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "uuid",
  "zcash_address",
  "zcash_client_backend",
  "zcash_client_sqlite",

@@ -1,0 +1,446 @@
+//! The sync driver. It runs on the wallet thread, one bounded step at a time, so
+//! commands and cancellation are handled between steps.
+
+use std::collections::BTreeSet;
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures_util::TryStreamExt;
+use serde::Serialize;
+use zcash_client_backend::data_api::chain::{error::Error as ChainError, scan_cached_blocks, ChainState, CommitmentTreeRoot};
+use zcash_client_backend::data_api::scanning::ScanPriority;
+use zcash_client_backend::data_api::{WalletCommitmentTrees, WalletRead, WalletWrite};
+use zcash_client_backend::proto::compact_formats::CompactBlock;
+use zcash_client_backend::proto::service::{GetSubtreeRootsArg, LightdInfo, ShieldedProtocol};
+use zcash_primitives::merkle_tree::HashSer;
+use zcash_protocol::consensus::BlockHeight;
+
+use super::cache::{grid_floor, BlockCache, GRID};
+use super::fetch::{self, Chunk};
+use super::frontier::{self, FrontierError};
+use crate::net::client::{connect, NetError};
+use crate::net::socks::{Isolation, ProxyAddr};
+use crate::network::ZNetwork;
+use crate::wallet::Db;
+
+/// Blocks within this distance of the tip stay cached for reorgs.
+pub const HEAD: u32 = 100;
+
+#[derive(Debug, Clone)]
+pub struct SyncConfig {
+    pub proxy: ProxyAddr,
+    /// Chunks go to these servers in turn; the first also answers tip queries.
+    pub servers: Vec<String>,
+    pub parallel: usize,
+    /// Cached chunks not yet scanned, plus downloads in flight, stay under this.
+    pub ahead: usize,
+    /// Shielded outputs per scan call, which bounds how long one step takes.
+    pub work_cap: usize,
+    pub tip_poll: Duration,
+}
+
+impl SyncConfig {
+    pub fn new(proxy: ProxyAddr, servers: Vec<String>) -> Self {
+        Self { proxy, servers, parallel: 2, ahead: 24, work_cap: 2_000, tip_poll: Duration::from_secs(30) }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    #[error(transparent)]
+    Net(#[from] NetError),
+    #[error("block cache: {0}")]
+    Cache(#[from] super::cache::CacheError),
+    #[error("wallet database: {0}")]
+    Db(String),
+    #[error("server {server} is on chain {got}, not {want}")]
+    WrongChain { server: String, got: String, want: String },
+    #[error("server {server} reports branch {got}; this wallet expects {want}; an update may be required")]
+    UnknownBranch { server: String, got: String, want: String },
+    #[error("server {server}: {detail}")]
+    Misbehaving { server: String, detail: String },
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Progress {
+    pub state: String,
+    pub tip: Option<u32>,
+    pub birthday: u32,
+    pub fully_scanned: Option<u32>,
+    pub blocks_fetched: u64,
+    pub blocks_scanned: u64,
+    pub outputs_scanned: u64,
+    pub downloads_in_flight: usize,
+    pub chunks_cached: usize,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Did work; call again.
+    Worked,
+    /// Waiting on the network.
+    Waiting,
+    /// Everything up to the known tip is scanned.
+    Synced,
+}
+
+enum Msg {
+    Chunk(u32, Result<Chunk, NetError>),
+    Head(u32, Result<Vec<CompactBlock>, NetError>),
+    Tip(Result<(u32, LightdInfo), NetError>),
+}
+
+pub struct Syncer {
+    params: ZNetwork,
+    cfg: SyncConfig,
+    rt: tokio::runtime::Handle,
+    cache: Arc<BlockCache>,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+    in_flight: BTreeSet<u32>,
+    head_in_flight: bool,
+    tip_in_flight: bool,
+    last_tip_poll: Option<Instant>,
+    tip: Option<u32>,
+    roots_loaded: bool,
+    next_server: usize,
+    /// The chain state after the last scan call, to continue mid-chunk cheaply.
+    last_end: Option<ChainState>,
+    pub progress: Progress,
+}
+
+fn db_err<E: std::fmt::Display>(e: E) -> SyncError {
+    SyncError::Db(e.to_string())
+}
+
+impl Syncer {
+    pub fn new(params: ZNetwork, cfg: SyncConfig, rt: tokio::runtime::Handle, cache: Arc<BlockCache>, birthday: u32) -> Self {
+        let (tx, rx) = channel();
+        Self {
+            params,
+            cfg,
+            rt,
+            cache,
+            tx,
+            rx,
+            in_flight: BTreeSet::new(),
+            head_in_flight: false,
+            tip_in_flight: false,
+            last_tip_poll: None,
+            tip: None,
+            roots_loaded: false,
+            next_server: 0,
+            last_end: None,
+            progress: Progress { state: "starting".into(), birthday, ..Default::default() },
+        }
+    }
+
+    fn server_for(&mut self) -> String {
+        let s = self.cfg.servers[self.next_server % self.cfg.servers.len()].clone();
+        self.next_server += 1;
+        s
+    }
+
+    /// Waits up to `timeout` for a download to land, so an idle loop does not spin.
+    pub fn wait(&mut self, db: &mut Db, timeout: Duration) -> Result<(), SyncError> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(msg) => self.handle(db, msg),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Ok(()),
+        }
+    }
+
+    pub fn step(&mut self, db: &mut Db) -> Result<Step, SyncError> {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.handle(db, msg)?;
+        }
+        self.poll_tip_if_due();
+        let Some(tip) = self.tip else {
+            self.progress.state = "connecting".into();
+            return Ok(Step::Waiting);
+        };
+        if !self.roots_loaded {
+            self.load_subtree_roots(db)?;
+            self.roots_loaded = true;
+        }
+        self.plan_downloads(db, tip)?;
+        let worked = self.scan_once(db, tip)?;
+        self.progress.fully_scanned = db.block_fully_scanned().map_err(db_err)?.map(|m| u32::from(m.block_height()));
+        self.progress.downloads_in_flight = self.in_flight.len() + usize::from(self.head_in_flight);
+        if worked {
+            self.progress.state = "scanning".into();
+            return Ok(Step::Worked);
+        }
+        let synced = self.progress.fully_scanned.is_some_and(|h| h >= tip) && self.in_flight.is_empty();
+        self.progress.state = if synced { "synced" } else { "downloading" }.into();
+        Ok(if synced { Step::Synced } else { Step::Waiting })
+    }
+
+    fn poll_tip_if_due(&mut self) {
+        let due = self.last_tip_poll.is_none_or(|t| t.elapsed() >= self.cfg.tip_poll);
+        if !due || self.tip_in_flight {
+            return;
+        }
+        self.tip_in_flight = true;
+        self.last_tip_poll = Some(Instant::now());
+        let (server, proxy, tx) = (self.cfg.servers[0].clone(), self.cfg.proxy.clone(), self.tx.clone());
+        self.rt.spawn(async move {
+            let _ = tx.send(Msg::Tip(fetch::tip_and_info(&server, &proxy, Isolation::fresh()).await));
+        });
+    }
+
+    fn handle(&mut self, db: &mut Db, msg: Msg) -> Result<(), SyncError> {
+        match msg {
+            Msg::Tip(r) => {
+                self.tip_in_flight = false;
+                match r {
+                    Ok((tip, info)) => {
+                        self.check_server(&self.cfg.servers[0].clone(), &info, tip)?;
+                        if self.tip.is_none_or(|t| t != tip) {
+                            db.update_chain_tip(BlockHeight::from(tip)).map_err(db_err)?;
+                            self.tip = Some(tip);
+                        }
+                        self.progress.tip = Some(tip);
+                    }
+                    Err(e) => self.progress.last_error = Some(e.to_string()),
+                }
+            }
+            Msg::Chunk(start, r) => {
+                self.in_flight.remove(&start);
+                match r {
+                    Ok(chunk) => self.store_chunk(chunk)?,
+                    Err(e) => self.progress.last_error = Some(e.to_string()),
+                }
+            }
+            Msg::Head(first, r) => {
+                self.head_in_flight = false;
+                match r {
+                    Ok(blocks) => {
+                        self.progress.blocks_fetched += blocks.len() as u64;
+                        let _ = first;
+                        self.cache.insert_blocks(&blocks)?;
+                    }
+                    Err(e) => self.progress.last_error = Some(e.to_string()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_server(&self, server: &str, info: &LightdInfo, tip: u32) -> Result<(), SyncError> {
+        let want = self.params.lightd_chain_name();
+        if info.chain_name != want {
+            return Err(SyncError::WrongChain { server: server.into(), got: info.chain_name.clone(), want: want.into() });
+        }
+        let want_branch = self.params.branch_id_hex(BlockHeight::from(tip + 1));
+        if !info.consensus_branch_id.eq_ignore_ascii_case(&want_branch) {
+            return Err(SyncError::UnknownBranch { server: server.into(), got: info.consensus_branch_id.clone(), want: want_branch });
+        }
+        Ok(())
+    }
+
+    /// Checks a chunk before it enters the cache: the blocks must continue the
+    /// tree state below them, and must lead to the tree state of the chunk above
+    /// if that one is already here.
+    fn store_chunk(&mut self, chunk: Chunk) -> Result<(), SyncError> {
+        let misbehaving = |detail: String| SyncError::Misbehaving { server: chunk.server.clone(), detail };
+        let below = chunk.below.to_chain_state().map_err(|e| misbehaving(e.to_string()))?;
+        if chunk.blocks.len() as u32 != chunk.last - chunk.start + 1 {
+            return Err(misbehaving(format!("returned {} blocks for {}..={}", chunk.blocks.len(), chunk.start, chunk.last)));
+        }
+        let end = frontier::advance(&below, &chunk.blocks).map_err(|e| misbehaving(e.to_string()))?;
+        if let Some(above) = self.cache.tree_state(chunk.last)? {
+            let above = above.to_chain_state().map_err(|e| misbehaving(e.to_string()))?;
+            if above.block_hash() != end.block_hash()
+                || above.final_sapling_tree() != end.final_sapling_tree()
+                || above.final_orchard_tree() != end.final_orchard_tree()
+                || above.final_ironwood_tree() != end.final_ironwood_tree()
+            {
+                return Err(misbehaving(format!("chunk {} does not lead to the tree state at {}", chunk.start, chunk.last)));
+            }
+        }
+        self.progress.blocks_fetched += chunk.blocks.len() as u64;
+        self.cache.insert_blocks(&chunk.blocks)?;
+        self.cache.put_tree_state(&chunk.below, &chunk.server)?;
+        self.cache.mark_chunk(chunk.start, chunk.last + 1, &chunk.server)?;
+        Ok(())
+    }
+
+    fn load_subtree_roots(&mut self, db: &mut Db) -> Result<(), SyncError> {
+        let (server, proxy) = (self.cfg.servers[0].clone(), self.cfg.proxy.clone());
+        let fetch = |p: ShieldedProtocol| {
+            let (server, proxy) = (server.clone(), proxy.clone());
+            async move {
+                let mut c = connect(&server, &proxy, Isolation::fresh()).await?;
+                let arg = GetSubtreeRootsArg { start_index: 0, shielded_protocol: p as i32, max_entries: 0 };
+                let roots: Vec<_> = c
+                    .get_subtree_roots(arg)
+                    .await
+                    .map_err(|status| NetError::Status { server: server.clone(), status })?
+                    .into_inner()
+                    .try_collect()
+                    .await
+                    .map_err(|status| NetError::Status { server: server.clone(), status })?;
+                Ok::<_, NetError>(roots)
+            }
+        };
+        fn parse<H: HashSer>(roots: Vec<zcash_client_backend::proto::service::SubtreeRoot>) -> Result<Vec<CommitmentTreeRoot<H>>, String> {
+            roots
+                .into_iter()
+                .map(|r| {
+                    let h = H::read(&r.root_hash[..]).map_err(|e| e.to_string())?;
+                    Ok(CommitmentTreeRoot::from_parts(BlockHeight::from_u32(r.completing_block_height as u32), h))
+                })
+                .collect()
+        }
+        let bad = |d: String| SyncError::Misbehaving { server: server.clone(), detail: d };
+        let sapling = parse::<sapling::Node>(self.rt.block_on(fetch(ShieldedProtocol::Sapling))?).map_err(bad)?;
+        let orchard = parse::<orchard::tree::MerkleHashOrchard>(self.rt.block_on(fetch(ShieldedProtocol::Orchard))?).map_err(bad)?;
+        let ironwood = parse::<orchard::tree::MerkleHashOrchard>(self.rt.block_on(fetch(ShieldedProtocol::Ironwood))?).map_err(bad)?;
+        db.put_sapling_subtree_roots(0, &sapling).map_err(db_err)?;
+        db.put_orchard_subtree_roots(0, &orchard).map_err(db_err)?;
+        db.put_ironwood_subtree_roots(0, &ironwood).map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Chunks still needed, from the tip down: those overlapping an unscanned range.
+    fn needed_chunks(&self, db: &Db, tip: u32) -> Result<Vec<u32>, SyncError> {
+        let mut starts = BTreeSet::new();
+        for r in db.suggest_scan_ranges().map_err(db_err)? {
+            if matches!(r.priority(), ScanPriority::Scanned | ScanPriority::Ignored) {
+                continue;
+            }
+            let (s, e) = (u32::from(r.block_range().start), u32::from(r.block_range().end).min(tip + 1));
+            let mut c = grid_floor(s);
+            while c < e {
+                starts.insert(c);
+                c += GRID;
+            }
+        }
+        Ok(starts.into_iter().rev().collect())
+    }
+
+    fn plan_downloads(&mut self, db: &Db, tip: u32) -> Result<(), SyncError> {
+        let tip_chunk = grid_floor(tip);
+        // The tip chunk grows block by block; fetch what is new since last time.
+        if !self.head_in_flight && self.cache.chunk_end(tip_chunk)?.is_some() {
+            let have = self.cache.contiguous_end(tip_chunk)?;
+            if have <= tip {
+                self.head_in_flight = true;
+                let (server, proxy, tx) = (self.server_for(), self.cfg.proxy.clone(), self.tx.clone());
+                self.rt.spawn(async move {
+                    let _ = tx.send(Msg::Head(have, fetch::fetch_blocks(&server, &proxy, have, tip).await));
+                });
+            }
+        }
+        let needed = self.needed_chunks(db, tip)?;
+        let mut cached = 0;
+        for &start in &needed {
+            if self.cache.chunk_end(start)?.is_some() {
+                cached += 1;
+            }
+        }
+        self.progress.chunks_cached = cached;
+        for start in needed {
+            if self.in_flight.len() >= self.cfg.parallel || cached + self.in_flight.len() >= self.cfg.ahead {
+                break;
+            }
+            if self.in_flight.contains(&start) || self.cache.chunk_end(start)?.is_some() {
+                continue;
+            }
+            let last = if start == tip_chunk { tip } else { start + GRID - 1 };
+            self.in_flight.insert(start);
+            let (server, proxy, tx) = (self.server_for(), self.cfg.proxy.clone(), self.tx.clone());
+            self.rt.spawn(async move {
+                let _ = tx.send(Msg::Chunk(start, fetch::fetch_chunk(&server, &proxy, start, last).await));
+            });
+        }
+        Ok(())
+    }
+
+    /// The chain state just below `start`, from the grid tree state and cached blocks.
+    fn state_before(&self, start: u32) -> Result<Option<ChainState>, SyncError> {
+        if let Some(s) = &self.last_end {
+            if u32::from(s.block_height()) + 1 == start {
+                return Ok(Some(s.clone()));
+            }
+        }
+        let g = grid_floor(start);
+        let Some(ts) = self.cache.tree_state(g - 1)? else { return Ok(None) };
+        let base = ts.to_chain_state().map_err(|e| SyncError::Misbehaving { server: "cache".into(), detail: e.to_string() })?;
+        let mut blocks = Vec::with_capacity((start - g) as usize);
+        for h in g..start {
+            match self.cache.block(h)? {
+                Some(b) => blocks.push(b),
+                None => return Ok(None),
+            }
+        }
+        frontier::advance(&base, &blocks)
+            .map(Some)
+            .map_err(|e: FrontierError| SyncError::Misbehaving { server: "cache".into(), detail: e.to_string() })
+    }
+
+    /// One scan call over cached blocks, in the wallet's priority order. Returns
+    /// whether anything was scanned.
+    fn scan_once(&mut self, db: &mut Db, tip: u32) -> Result<bool, SyncError> {
+        for r in db.suggest_scan_ranges().map_err(db_err)? {
+            if matches!(r.priority(), ScanPriority::Scanned | ScanPriority::Ignored) {
+                continue;
+            }
+            let (rs, re) = (u32::from(r.block_range().start), u32::from(r.block_range().end).min(tip + 1));
+            // Highest cached window first: downloads arrive from the tip down.
+            let mut c = grid_floor(re.saturating_sub(1));
+            loop {
+                let ws = rs.max(c);
+                if ws < re && self.cache.chunk_end(c)?.is_some() {
+                    let avail = self.cache.contiguous_end(ws)?.min(re).min(c + GRID);
+                    if avail > ws {
+                        if let Some(state) = self.state_before(ws)? {
+                            return self.scan_window(db, ws, avail, state).map(|_| true);
+                        }
+                    }
+                }
+                if c <= rs || c < GRID {
+                    break;
+                }
+                c -= GRID;
+            }
+        }
+        Ok(false)
+    }
+
+    fn scan_window(&mut self, db: &mut Db, start: u32, end: u32, state: ChainState) -> Result<(), SyncError> {
+        // Bound the call by work, not by block count.
+        let mut blocks = Vec::new();
+        let mut outputs = 0usize;
+        for h in start..end {
+            let Some(b) = self.cache.block(h)? else { break };
+            outputs += b.vtx.iter().map(|t| t.outputs.len() + t.actions.len() + t.ironwood_actions.len()).sum::<usize>();
+            blocks.push(b);
+            if outputs >= self.cfg.work_cap {
+                break;
+            }
+        }
+        let limit = blocks.len();
+        match scan_cached_blocks(&self.params, self.cache.as_ref(), db, BlockHeight::from(start), &state, limit) {
+            Ok(_) => {
+                self.last_end = frontier::advance(&state, &blocks).ok();
+                self.progress.blocks_scanned += limit as u64;
+                self.progress.outputs_scanned += outputs as u64;
+                Ok(())
+            }
+            Err(ChainError::Scan(e)) if e.is_continuity_error() => {
+                let at = u32::from(e.at_height());
+                let target = BlockHeight::from(at.saturating_sub(10));
+                let rewound = db.truncate_to_height(target).map_err(db_err)?;
+                self.cache.truncate_from(u32::from(rewound) + 1)?;
+                self.last_end = None;
+                self.progress.last_error = Some(format!("chain changed at {at}; rewound to {}", u32::from(rewound)));
+                Ok(())
+            }
+            Err(e) => Err(SyncError::Db(e.to_string())),
+        }
+    }
+}

@@ -2,8 +2,10 @@
 
 pub mod keys;
 pub mod net;
+pub mod network;
 pub mod storage;
 pub mod sync;
+pub mod wallet;
 
 #[cfg(test)]
 mod smoke {
