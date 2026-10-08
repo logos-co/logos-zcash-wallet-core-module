@@ -17,8 +17,10 @@ pub trait ZcashWalletCoreModule: Send + Sync + 'static {
     /// `{ ok, version, crates }`.
     fn version(&self) -> String;
     /// Starts `create_wallet`, `restore_wallet`, `open_wallet`, `close_wallet`,
-    /// `change_password`, `propose` (`{ send }`) or `sign_and_send` (`{ proposalId,
-    /// password }`). `params` is a JSON object. `{ ok, jobId, receipt }`.
+    /// `change_password`, `propose` (`{ send }`), `propose_shielding` (`{ address }`),
+    /// `sign_and_send` (`{ proposalId, password }`), `plan_migration`, `sign_migration`
+    /// (`{ planId, digest, password }`), `pause_migration`, `resume_migration` or
+    /// `cancel_migration`. `params` is a JSON object. `{ ok, jobId, receipt }`.
     fn start_job(&self, kind: String, params: String) -> String;
     /// `{ ok, jobId, kind, state: queued|running|done|failed|cancelled, error }`.
     fn job_status(&self, job_id: String, receipt: String) -> String;
@@ -42,6 +44,9 @@ pub trait ZcashWalletCoreModule: Send + Sync + 'static {
     /// `{ ok, page, pageSize, rows: [{ txid, kind: received|sent|shielded|migration, height,
     /// pending, expired, expiryHeight, time, delta, fee, pools, memos, to, amountMadePublic }] }`.
     fn history(&self, account: String, page: i64) -> String;
+    /// The Orchard-to-Ironwood run, if any: status, counts, ZEC migrated, paused, and
+    /// whether it needs approval again.
+    fn migration_status(&self) -> String;
     /// The recovery phrase, once, after checking the password.
     fn reveal_seed(&self, password: String) -> String;
     /// The account's Unified Full Viewing Key, after checking the password.
@@ -57,6 +62,8 @@ pub trait ZcashWalletCoreModuleEvents {
     fn sync_progress(&self, payload: String);
     /// balances()'s shape, when it changes.
     fn balance_changed(&self, payload: String);
+    /// migration_status()'s shape, or `{ needsApproval }`, when the run moves.
+    fn migration_changed(&self, payload: String);
     fn job_finished(&self, job_id: String, state: String);
 }
 
@@ -154,6 +161,10 @@ impl ZcashWalletCoreModule for ZcashWalletCoreModuleImpl {
         self.gated(|e| e.new_address())
     }
 
+    fn migration_status(&self) -> String {
+        self.gated(|e| e.migration_status())
+    }
+
     fn history(&self, _account: String, page: i64) -> String {
         self.gated(|e| e.history(page.clamp(0, u32::MAX as i64) as u32))
     }
@@ -176,12 +187,18 @@ impl ZcashWalletCoreModule for ZcashWalletCoreModuleImpl {
             Event::WalletState(v) => emit_wallet_state_changed(&v.to_string()),
             Event::SyncProgress(v) => emit_sync_progress(&v.to_string()),
             Event::BalanceChanged(v) => emit_balance_changed(&v.to_string()),
+            Event::MigrationChanged(v) => emit_migration_changed(&v.to_string()),
             Event::JobFinished { id, state } => emit_job_finished(&id, state),
         });
         // Sapling parameters ship beside the plugin; ZCASH_PARAMS_DIR overrides for development.
-        let params = std::env::var_os("ZCASH_PARAMS_DIR")
-            .map(std::path::PathBuf::from)
-            .or_else(|| Some(std::path::PathBuf::from(&ctx.module_path).join("params")));
+        let params = std::env::var_os("ZCASH_PARAMS_DIR").map(std::path::PathBuf::from).or_else(|| {
+            let m = std::path::PathBuf::from(&ctx.module_path);
+            let parent = m.parent().map(|p| p.to_path_buf());
+            [Some(m.clone()), Some(m.join("lib")), parent.clone(), parent.map(|p| p.join("lib"))]
+                .into_iter()
+                .flatten()
+                .find(|d| d.join("sapling-spend.params").is_file())
+        });
         let _ = self.engine.set(Engine::new(dir.join("wallets"), sink, None, params));
     }
 }

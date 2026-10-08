@@ -32,6 +32,7 @@ pub enum Event {
     WalletState(Value),
     SyncProgress(Value),
     BalanceChanged(Value),
+    MigrationChanged(Value),
     JobFinished { id: String, state: &'static str },
 }
 
@@ -64,6 +65,9 @@ enum Task {
     Propose { input: crate::send::SendInput },
     ProposeShielding { address: String },
     SignAndSend { proposal: String, password: Zeroizing<String> },
+    PlanMigration,
+    SignMigration { plan: String, digest: String, password: Zeroizing<String> },
+    MigrationControl(&'static str),
     ChangePassword { network: ZNetwork, name: String, old: Zeroizing<String>, new: Zeroizing<String> },
 }
 
@@ -81,6 +85,8 @@ struct Params {
     send: Option<crate::send::SendInput>,
     proposal_id: Option<String>,
     address: Option<String>,
+    plan_id: Option<String>,
+    digest: Option<String>,
 }
 
 impl Drop for Params {
@@ -129,6 +135,15 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
         },
         "close_wallet" => Task::Close,
         "propose" => Task::Propose { input: p.send.clone().ok_or("send is required")? },
+        "plan_migration" => Task::PlanMigration,
+        "sign_migration" => Task::SignMigration {
+            plan: p.plan_id.clone().ok_or("planId is required")?,
+            digest: p.digest.clone().ok_or("digest is required")?,
+            password: take(&mut p.password, "password")?,
+        },
+        "pause_migration" => Task::MigrationControl("pause"),
+        "resume_migration" => Task::MigrationControl("resume"),
+        "cancel_migration" => Task::MigrationControl("cancel"),
         "propose_shielding" => Task::ProposeShielding { address: p.address.clone().ok_or("address is required")? },
         "sign_and_send" => Task::SignAndSend {
             proposal: p.proposal_id.clone().ok_or("proposalId is required")?,
@@ -148,6 +163,10 @@ enum WalletCmd {
     NewAddress(Sender<Result<Value, String>>),
     Propose(crate::send::SendInput, Sender<Result<Value, String>>),
     ProposeShielding(String, Sender<Result<Value, String>>),
+    PlanMigration(Sender<Result<Value, String>>),
+    SignMigration(String, String, Phrase, Sender<Result<Value, String>>),
+    MigrationControl(&'static str, Sender<Result<Value, String>>),
+    MigrationStatus(Sender<Result<Value, String>>),
     Sign(String, Phrase, Arc<zcash_proofs::prover::LocalTxProver>, Sender<Result<Vec<(String, Vec<u8>)>, String>>),
 }
 
@@ -269,6 +288,9 @@ impl Engine {
             Task::Close => Ok(self.close()),
             Task::Propose { input } => self.propose(input),
             Task::ProposeShielding { address } => self.ask(|tx| WalletCmd::ProposeShielding(address, tx), Duration::from_secs(60)),
+            Task::PlanMigration => self.ask(WalletCmd::PlanMigration, Duration::from_secs(120)),
+            Task::SignMigration { plan, digest, password } => self.sign_migration(plan, digest, &password),
+            Task::MigrationControl(what) => self.ask(|tx| WalletCmd::MigrationControl(what, tx), Duration::from_secs(60)),
             Task::SignAndSend { proposal, password } => self.sign_and_send(&proposal, &password),
             Task::ChangePassword { network, name, old, new } => WalletDir::new(&self.root, network, &name)
                 .change_password(&old, &new, self.work_factor)
@@ -330,17 +352,20 @@ impl Engine {
         let writer = dir.open_db(network, &key).map_err(|e| e.to_string())?;
         let reader = dir.open_conn(&key).map_err(|e| e.to_string())?;
         let cache = Arc::new(dir.open_cache(&key).map_err(|e| e.to_string())?);
+        let mig_conn = dir.open_conn(&key).map_err(|e| e.to_string())?;
         drop(key);
 
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(Progress::default()));
         let (cmd_tx, cmd_rx) = channel();
+        let net = (self.rt.handle().clone(), cfg.clone());
+        let paused_flag = dir.path.join("migration-paused");
         let syncer = Syncer::new(network, cfg, self.rt.handle().clone(), cache, meta.birthday_height);
         let thread = {
             let (stop, progress, sink) = (stop.clone(), progress.clone(), self.sink.clone());
             std::thread::Builder::new()
                 .name("zcash-wallet".into())
-                .spawn(move || wallet_loop(writer, syncer, cmd_rx, stop, progress, sink, account))
+                .spawn(move || wallet_loop(writer, syncer, cmd_rx, stop, progress, sink, account, mig_conn, net, paused_flag))
                 .map_err(|e| e.to_string())?
         };
         let result = json!({"name": meta.name, "network": meta.network, "birthdayHeight": meta.birthday_height, "accountUuid": meta.account_uuid});
@@ -431,6 +456,17 @@ impl Engine {
             sent.push(outcome);
         }
         Ok(json!({"transactions": sent}))
+    }
+
+    /// Decrypts the phrase and has the wallet thread commit exactly the plan reviewed.
+    fn sign_migration(&self, plan: String, digest: String, password: &str) -> Result<Value, String> {
+        let dir = self.with_open(|w| Ok(WalletDir { path: w.dir.path.clone() }))?;
+        let phrase = dir.unseal_phrase(password).map_err(|e| e.to_string())?;
+        self.ask(|tx| WalletCmd::SignMigration(plan, digest, phrase, tx), Duration::from_secs(600))
+    }
+
+    pub fn migration_status(&self) -> Value {
+        self.ask(WalletCmd::MigrationStatus, Duration::from_secs(15)).unwrap_or_else(|e| json!({"ok": false, "error": e}))
     }
 
     pub fn list_wallets(&self, network: &str) -> Value {
@@ -625,6 +661,7 @@ fn keep(
     Ok(json!({"proposalId": id, "preview": preview}))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wallet_loop(
     mut db: Db,
     mut syncer: Syncer,
@@ -633,7 +670,13 @@ fn wallet_loop(
     progress: Arc<Mutex<Progress>>,
     sink: Sink,
     account: AccountUuid,
+    mut mig_conn: rusqlite::Connection,
+    net: (tokio::runtime::Handle, SyncConfig),
+    paused_flag: PathBuf,
 ) {
+    let mut plans: std::collections::HashMap<String, (zcash_pool_migration::engine::MigrationPlan, Value, Instant)> = Default::default();
+    let mut last_drive = Instant::now() - Duration::from_secs(60);
+    let mut blocker: Option<&'static str> = None;
     let mut backoff = Duration::from_millis(500);
     let mut last_emit = Instant::now() - Duration::from_secs(60);
     let mut last_balance: Option<Value> = None;
@@ -662,6 +705,51 @@ fn wallet_loop(
                 WalletCmd::ProposeShielding(address, reply) => {
                     let r = crate::send::propose_shield(&mut db, params, account, &address)
                         .and_then(|p| keep(&mut prepared, &mut next_proposal, &params, p));
+                    let _ = reply.send(r);
+                }
+                WalletCmd::PlanMigration(reply) => {
+                    let tip = db.chain_height().ok().flatten().map_or(0, u32::from);
+                    let r = crate::migration::plan(&db, &mut mig_conn, params, account).map(|plan| {
+                        let preview = crate::migration::preview(&params, &plan, tip);
+                        let id = format!("m{}", plans.len() + 1);
+                        plans.insert(id.clone(), (plan, preview.clone(), Instant::now()));
+                        json!({"planId": id, "preview": preview})
+                    });
+                    let _ = reply.send(r);
+                }
+                WalletCmd::SignMigration(id, digest, phrase, reply) => {
+                    let r = match plans.remove(&id) {
+                        None => Err("unknown or expired plan".to_string()),
+                        Some((_, preview, _)) if preview["digest"].as_str() != Some(digest.as_str()) => {
+                            Err("the plan changed since it was reviewed".to_string())
+                        }
+                        Some((plan, preview, _)) => crate::migration::commit(&db, &mut mig_conn, params, account, &plan, &preview, &phrase),
+                    };
+                    drop(phrase);
+                    if r.is_ok() {
+                        sink(Event::MigrationChanged(crate::migration::status(&mut mig_conn, params, account).unwrap_or_default()));
+                    }
+                    let _ = reply.send(r);
+                }
+                WalletCmd::MigrationControl(what, reply) => {
+                    let r = match what {
+                        "pause" => std::fs::write(&paused_flag, b"paused").map(|_| json!({"paused": true})).map_err(|e| e.to_string()),
+                        "resume" => {
+                            let _ = std::fs::remove_file(&paused_flag);
+                            blocker = None;
+                            Ok(json!({"paused": false}))
+                        }
+                        _ => crate::migration::cancel(&mut mig_conn, params, account),
+                    };
+                    sink(Event::MigrationChanged(crate::migration::status(&mut mig_conn, params, account).unwrap_or_default()));
+                    let _ = reply.send(r);
+                }
+                WalletCmd::MigrationStatus(reply) => {
+                    let r = crate::migration::status(&mut mig_conn, params, account).map(|mut v| {
+                        v["paused"] = json!(paused_flag.exists());
+                        v["needsApproval"] = json!(blocker);
+                        v
+                    });
                     let _ = reply.send(r);
                 }
                 WalletCmd::Sign(id, phrase, prover, reply) => {
@@ -693,6 +781,36 @@ fn wallet_loop(
         if last_emit.elapsed() >= Duration::from_secs(1) {
             sink(Event::SyncProgress(json!(syncer.progress)));
             last_emit = Instant::now();
+        }
+        // Plans expire with their anchor bucket: 144 blocks is about an hour after NU7.
+        plans.retain(|_, (_, _, t)| t.elapsed() < Duration::from_secs(3600));
+        // The migration moves only on a synced wallet, at most every 30 s, between sync steps.
+        if syncer.progress.state == "synced" && !paused_flag.exists() && last_drive.elapsed() >= Duration::from_secs(30) {
+            last_drive = Instant::now();
+            let (rt, cfg) = (&net.0, &net.1);
+            // Broadcast through a server other than the one syncing, when there is one.
+            let server = cfg.servers.get(1).unwrap_or(&cfg.servers[0]).clone();
+            let mut send = |raw: Vec<u8>| -> Result<(bool, String), String> {
+                rt.block_on(fetch::send_transaction(&server, &cfg.proxy, raw))
+                    .map(|(code, msg)| (code == 0, msg))
+                    .map_err(|e| e.to_string())
+            };
+            match crate::migration::drive(&mut db, &mut mig_conn, params, account, &mut send) {
+                Ok(crate::migration::Drive::None) | Ok(crate::migration::Drive::Waiting(_)) => {}
+                Ok(crate::migration::Drive::NeedsApproval(why)) => {
+                    if blocker != Some(why) {
+                        blocker = Some(why);
+                        sink(Event::MigrationChanged(json!({"needsApproval": why})));
+                    }
+                }
+                Ok(other) => {
+                    blocker = None;
+                    let mut v = crate::migration::status(&mut mig_conn, params, account).unwrap_or_default();
+                    v["lastStep"] = json!(format!("{other:?}"));
+                    sink(Event::MigrationChanged(v));
+                }
+                Err(e) => syncer.progress.last_error = Some(format!("migration: {e}")),
+            }
         }
         if last_balance_check.elapsed() >= Duration::from_secs(2) {
             last_balance_check = Instant::now();

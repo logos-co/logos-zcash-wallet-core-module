@@ -6,6 +6,7 @@ pub mod gate;
 pub mod history;
 pub mod jobs;
 pub mod keys;
+pub mod migration;
 pub mod net;
 pub mod network;
 pub mod send;
