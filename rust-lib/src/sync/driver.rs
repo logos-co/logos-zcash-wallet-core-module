@@ -22,6 +22,7 @@ use super::enhance::{self, Fetched};
 use super::fetch::{self, Chunk};
 use super::frontier::{self, FrontierError};
 use crate::net::client::{connect, NetError};
+use crate::net::ipc::LOCAL_NODE_URL;
 use crate::net::socks::{Isolation, ProxyAddr};
 use crate::network::ZNetwork;
 use crate::wallet::Db;
@@ -450,7 +451,10 @@ impl Syncer {
 
     /// Sends out what the wallet asks to learn, a few at a time.
     fn plan_enhancements(&mut self, db: &Db, tip: u32) -> Result<(), SyncError> {
-        if self.last_enh.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+        // The delays only keep a server from tying requests together; the local node is ours.
+        let local = self.cfg.servers.first().is_some_and(|s| s == LOCAL_NODE_URL);
+        let (every, at_once) = if local { (Duration::from_secs(1), 16) } else { (Duration::from_secs(10), 4) };
+        if self.last_enh.is_some_and(|t| t.elapsed() < every) {
             return Ok(());
         }
         self.last_enh = Some(Instant::now());
@@ -458,17 +462,19 @@ impl Syncer {
         self.progress.details_pending = requests.len();
         let now = SystemTime::now();
         for req in requests {
-            if self.enh_in_flight.len() >= 4 {
+            if self.enh_in_flight.len() >= at_once {
                 break;
             }
-            if self.enh_in_flight.contains(&req) || enhance::not_before(&req).is_some_and(|t| t > now) {
+            if self.enh_in_flight.contains(&req) || (!local && enhance::not_before(&req).is_some_and(|t| t > now)) {
                 continue;
             }
             self.enh_in_flight.insert(req.clone());
             let server = enhance::pick(&self.cfg.servers).to_string();
             let (proxy, tx, params) = (self.cfg.proxy.clone(), self.tx.clone(), self.params);
             self.rt.spawn(async move {
-                tokio::time::sleep(enhance::random_delay()).await;
+                if !local {
+                    tokio::time::sleep(enhance::random_delay()).await;
+                }
                 let r = enhance::fetch(params, &server, &proxy, &req, tip).await;
                 let _ = tx.send(Msg::Enhanced(req, r));
             });
