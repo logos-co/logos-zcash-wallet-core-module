@@ -2,6 +2,10 @@
 
 use zcash_protocol::consensus::{self, BlockHeight, NetworkType, NetworkUpgrade, Parameters};
 
+/// NU7's mainnet height, set here the day ZIP 259 fixes it (due 2026-10-20) if the
+/// final crates are late. Branch IDs follow from it.
+pub const MAINNET_NU7_OVERRIDE: Option<u32> = None;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ZNetwork {
     Main,
@@ -51,13 +55,24 @@ impl Parameters for ZNetwork {
     }
 
     fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
-        self.inner().activation_height(nu)
+        match (self, nu, MAINNET_NU7_OVERRIDE) {
+            (ZNetwork::Main, NetworkUpgrade::Nu7, Some(h)) => Some(BlockHeight::from(h)),
+            _ => self.inner().activation_height(nu),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mainnet_nu7_is_unset_until_zip_259_fixes_it() {
+        // The pre-release crates carry no mainnet height; sends near it are handled by
+        // expiry_for, and the release gate checks this before any mainnet release.
+        assert_eq!(MAINNET_NU7_OVERRIDE, None);
+        assert_eq!(ZNetwork::Main.activation_height(NetworkUpgrade::Nu7), None);
+    }
 
     #[test]
     fn testnet_branch_after_nu7() {
