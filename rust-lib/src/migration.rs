@@ -20,6 +20,7 @@ use zcash_pool_migration::engine::{
 use zcash_pool_migration::satisfiability::{advance_migration, AdvanceConfig, DuenessTargets, ReorgSettleDepth, ReplanThreshold};
 use zcash_pool_migration::state::{AdvanceStep, StepKind};
 use zcash_pool_migration::wallet::{WalletMigration, WalletMigrationProver};
+use zcash_primitives::transaction::fees::zip317::{GRACE_ACTIONS, MARGINAL_FEE};
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
 use crate::keys::Phrase;
@@ -79,6 +80,12 @@ pub fn preview(params: &ZNetwork, plan: &MigrationPlan, tip: u32) -> Value {
         .map(|s| json!({"broadcastHeight": u32::from(s.broadcast_height()), "expiryHeight": u32::from(s.expiry_height())}))
         .collect();
     let last = plan.schedule().iter().map(|s| u32::from(s.broadcast_height())).max().unwrap_or(tip);
+    // ZIP 317 per transaction: the marginal fee for every action, with a two-action floor.
+    let fee_total: u64 = plan
+        .planned_transactions()
+        .iter()
+        .map(|t| MARGINAL_FEE.into_u64() * u64::from(t.actions().max(GRACE_ACTIONS as u32)))
+        .sum();
     let nu7 = nu7_height(params);
     let crosses_nu7 = nu7.is_some_and(|h| tip < h && last + NU7_GUARD_BLOCKS + two_hours_of_blocks(params, last) >= h);
     let mut v = json!({
@@ -89,7 +96,12 @@ pub fn preview(params: &ZNetwork, plan: &MigrationPlan, tip: u32) -> Value {
         "preparationTransactions": plan.preparation().transaction_count(),
         "preparationLayers": plan.preparation().layer_count(),
         "transfers": plan.schedule().len(),
+        "feeTotal": fee_total,
+        // Change and dust below a self-funding note stay in Orchard.
+        "remainder": plan.residual().into_u64(),
         "schedule": schedule,
+        // Signed transfers expire from here; one not yet broadcast is then signed again.
+        "expiresAt": plan.schedule().iter().map(|s| u32::from(s.expiry_height())).min(),
         "firstBroadcast": plan.schedule().iter().map(|s| u32::from(s.broadcast_height())).min(),
         "lastBroadcast": last,
         "chainTip": tip,

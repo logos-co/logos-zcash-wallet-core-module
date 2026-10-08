@@ -90,6 +90,7 @@ enum Task {
     Close,
     Propose { input: crate::send::SendInput },
     ProposeShielding { address: String },
+    ProposeMigrateNow,
     SignAndSend { proposal: String, password: Zeroizing<String> },
     PlanMigration,
     SignMigration { plan: String, digest: String, password: Zeroizing<String> },
@@ -171,6 +172,7 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
         "resume_migration" => Task::MigrationControl("resume"),
         "cancel_migration" => Task::MigrationControl("cancel"),
         "propose_shielding" => Task::ProposeShielding { address: p.address.clone().ok_or("address is required")? },
+        "propose_migrate_now" => Task::ProposeMigrateNow,
         "sign_and_send" => Task::SignAndSend {
             proposal: p.proposal_id.clone().ok_or("proposalId is required")?,
             password: take(&mut p.password, "password")?,
@@ -189,6 +191,7 @@ enum WalletCmd {
     NewAddress(Sender<Result<Value, String>>),
     Propose(crate::send::SendInput, Sender<Result<Value, String>>),
     ProposeShielding(String, Sender<Result<Value, String>>),
+    ProposeMigrateNow(Sender<Result<Value, String>>),
     PlanMigration(Sender<Result<Value, String>>),
     SignMigration(String, String, Phrase, Sender<Result<Value, String>>),
     MigrationControl(&'static str, Sender<Result<Value, String>>),
@@ -314,6 +317,7 @@ impl Engine {
             Task::Close => Ok(self.close()),
             Task::Propose { input } => self.propose(input),
             Task::ProposeShielding { address } => self.ask(|tx| WalletCmd::ProposeShielding(address, tx), Duration::from_secs(60)),
+            Task::ProposeMigrateNow => self.ask(WalletCmd::ProposeMigrateNow, Duration::from_secs(60)),
             Task::PlanMigration => self.ask(WalletCmd::PlanMigration, Duration::from_secs(120)),
             Task::SignMigration { plan, digest, password } => self.sign_migration(plan, digest, &password),
             Task::MigrationControl(what) => self.ask(|tx| WalletCmd::MigrationControl(what, tx), Duration::from_secs(60)),
@@ -811,6 +815,12 @@ fn wallet_loop(
                         crate::send::propose_shield(&mut db, params, account, &address).map(|p| vec![p])
                     }
                     .and_then(|ps| keep(&mut prepared, &mut next_proposal, &params, ps));
+                    let _ = reply.send(r);
+                }
+                WalletCmd::ProposeMigrateNow(reply) => {
+                    let r = crate::send::propose_migrate_now(&mut db, params, account)
+                        .map(crate::send::AnyProposal::MigrateNow)
+                        .and_then(|p| keep(&mut prepared, &mut next_proposal, &params, vec![p]));
                     let _ = reply.send(r);
                 }
                 WalletCmd::PlanMigration(reply) => {

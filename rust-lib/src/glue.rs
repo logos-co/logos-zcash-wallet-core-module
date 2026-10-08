@@ -18,9 +18,9 @@ pub trait ZcashWalletCoreModule: Send + Sync + 'static {
     fn version(&self) -> String;
     /// Starts `create_wallet`, `restore_wallet`, `open_wallet`, `close_wallet`,
     /// `change_password`, `propose` (`{ send }`), `propose_shielding` (`{ address }`),
-    /// `sign_and_send` (`{ proposalId, password }`), `plan_migration`, `sign_migration`
-    /// (`{ planId, digest, password }`), `pause_migration`, `resume_migration` or
-    /// `cancel_migration`. `params` is a JSON object. `{ ok, jobId, receipt }`.
+    /// `propose_migrate_now`, `sign_and_send` (`{ proposalId, password }`), `plan_migration`,
+    /// `sign_migration` (`{ planId, digest, password }`), `pause_migration`,
+    /// `resume_migration` or `cancel_migration`. `params` is a JSON object. `{ ok, jobId, receipt }`.
     fn start_job(&self, kind: String, params: String) -> String;
     /// `{ ok, jobId, kind, state: queued|running|done|failed|cancelled, error }`.
     fn job_status(&self, job_id: String, receipt: String) -> String;
