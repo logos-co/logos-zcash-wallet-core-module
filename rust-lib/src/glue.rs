@@ -181,6 +181,7 @@ impl ZcashWalletCoreModule for ZcashWalletCoreModuleImpl {
 
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         let dir = std::path::PathBuf::from(&ctx.instance_persistence_path);
+        crate::storage::init_log(&dir);
         let callers = std::fs::read_to_string(dir.join("callers.json")).ok();
         *self.callers.lock().unwrap() = Callers::from_file(callers.as_deref());
         let sink: Sink = Arc::new(|ev| match ev {

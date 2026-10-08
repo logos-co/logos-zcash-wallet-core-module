@@ -213,7 +213,10 @@ impl Syncer {
                         }
                         self.progress.tip = Some(tip);
                     }
-                    Err(e) => self.progress.last_error = Some(e.to_string()),
+                    Err(e) => {
+                        tracing::warn!(target: "zcash", "tip poll: {e}");
+                        self.progress.last_error = Some(e.to_string());
+                    }
                 }
             }
             Msg::Chunk(start, r) => {
@@ -512,6 +515,7 @@ impl Syncer {
             }
             Err(ChainError::Scan(e)) if e.is_continuity_error() => {
                 let at = u32::from(e.at_height());
+                tracing::warn!(target: "zcash", "chain changed at {at}; rewinding");
                 let target = BlockHeight::from(at.saturating_sub(10));
                 let rewound = db.truncate_to_height(target).map_err(db_err)?;
                 self.cache.truncate_from(u32::from(rewound) + 1)?;

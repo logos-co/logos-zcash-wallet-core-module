@@ -27,3 +27,19 @@ pub fn open_encrypted(path: &Path, key: &[u8; 32]) -> Result<Connection, Storage
     rusqlite::vtab::array::load_module(&conn)?;
     Ok(conn)
 }
+
+/// Logs to `core.log` in the persistence directory, restarting it past 10 MB. Never
+/// logs secrets: callers pass only heights, counts, txids and errors.
+pub fn init_log(dir: &Path) {
+    let path = dir.join("core.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 10 * 1024 * 1024) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+    }
+}

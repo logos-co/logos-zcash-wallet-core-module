@@ -63,6 +63,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 # Provided by logos-module-builder at build time (staged into ../logos-rust-sdk-src).
 logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
