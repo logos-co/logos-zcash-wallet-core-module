@@ -60,7 +60,8 @@ pub fn page(conn: &Connection, network: ZNetwork, account: AccountUuid, page: u3
     let mut out = vec![];
     let mut outputs = conn
         .prepare_cached(
-            "SELECT output_pool, value, is_change, memo, to_address, is_sent_row
+            "SELECT output_pool, value, is_change, memo, to_address,
+                    from_account_uuid = ?2 AND (to_account_uuid IS NULL OR to_account_uuid != ?2)
              FROM v_tx_outputs WHERE txid = ?1 ORDER BY output_pool, output_index",
         )
         .map_err(|e| e.to_string())?;
@@ -71,8 +72,8 @@ pub fn page(conn: &Connection, network: ZNetwork, account: AccountUuid, page: u3
         let mut memos = vec![];
         let mut to = vec![];
         let outs = outputs
-            .query_map([&txid], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?, r.get::<_, Option<Vec<u8>>>(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, bool>(5)?))
+            .query_map(params![&txid, uuid], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?, r.get::<_, Option<Vec<u8>>>(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, Option<bool>>(5)?.unwrap_or(false)))
             })
             .map_err(|e| e.to_string())?;
         for o in outs {
