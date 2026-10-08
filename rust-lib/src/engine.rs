@@ -68,8 +68,8 @@ impl Routes {
             cfg.tip_poll = Duration::from_secs(2);
             cfg
         } else {
-            if remote.iter().any(|s| !s.starts_with("https://")) {
-                return Err("servers must be https:// URLs".into());
+            if remote.iter().any(|s| !s.starts_with("https://") && !crate::net::client::is_onion_url(s)) {
+                return Err("servers must be https:// URLs, or http:// onion services".into());
             }
             SyncConfig::new(ProxyAddr::parse(&self.proxy)?, self.servers.clone())
         };
@@ -986,6 +986,10 @@ mod tests {
         // Anything remote still needs Tor; plain http and other modules are refused.
         assert!(routes("", &[LOCAL_NODE_URL], &["https://zec.rocks:443"]).config().is_err());
         assert!(routes(tor, &[LOCAL_NODE_URL], &["http://zec.rocks:80"]).config().is_err());
+        // An onion service needs no TLS, but always Tor.
+        let onion = format!("http://{}.onion:9067", "a2".repeat(28));
+        assert!(routes(tor, &[onion.as_str()], &[]).config().is_ok());
+        assert!(routes("", &[onion.as_str()], &[]).config().is_err());
         assert!(routes(tor, &["logos://other_module"], &[]).config().is_err());
         // An empty broadcast list syncs but leaves nothing to send through.
         let mut r = routes(tor, &[LOCAL_NODE_URL], &[]);
