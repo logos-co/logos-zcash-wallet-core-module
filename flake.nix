@@ -36,6 +36,18 @@
           cp $spend $out/lib/sapling-spend.params
           cp $output $out/lib/sapling-output.params
         '';
+      # tools/regtest/chain.sh with what it runs on, for test harnesses such as the app's doctest.
+      # ZEBRAD and LIGHTWALLETD stay the caller's: logos-zebra-nix builds both.
+      regtestChain = system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in
+        pkgs.runCommand "zcash-regtest-chain" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
+          mkdir -p $out/bin $out/share/regtest
+          install -m 755 ${./tools/regtest/chain.sh} $out/share/regtest/chain.sh
+          install -m 644 ${./tools/regtest/regtest.json} $out/share/regtest/regtest.json
+          patchShebangs $out/share/regtest
+          makeWrapper $out/share/regtest/chain.sh $out/bin/regtest-chain \
+            --prefix PATH : ${nixpkgs.lib.makeBinPath [ pkgs.curl pkgs.perl pkgs.python3 ]}
+        '';
     in
     {
       packages = forAllSystems (system:
@@ -44,6 +56,7 @@
           configFile = ./metadata.json;
           flakeInputs = inputs;
           externalLibInputs.zcash_sapling_params = saplingParams system;
-        }).packages.${system});
+        }).packages.${system}
+        // nixpkgs.lib.optionalAttrs (system != "x86_64-windows") { regtest-chain = regtestChain system; });
     };
 }

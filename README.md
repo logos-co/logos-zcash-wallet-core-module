@@ -80,11 +80,18 @@ coinbase, and matures it all. The wallet joins with proxy `"direct"`, which only
 wallet accepts, and only for `http://127.0.0.1:` servers. A module instance runs regtest when
 its persistence directory holds `regtest.json`.
 
+logos-zebra-nix builds both processes: `regtest-zebrad` runs zebrad's command line on
+libzebrad_c, and `lightwalletd` is v0.5.4. `nix build .#regtest-chain` packages the script
+with `regtest.json` (in `share/regtest/`) for harnesses outside this repository, such as
+the app's doctest.
+
 ```bash
 cd rust-lib
+nix build github:logos-co/logos-zebra-nix#regtest-zebrad -o zebrad
+nix build github:logos-co/logos-zebra-nix#lightwalletd -o lightwalletd
 cargo run --no-default-features --example regtest_keys -- ../tools/regtest/regtest.json > keys.json
 jq -r .phrase keys.json > phrase.txt
-ZEBRAD=... LIGHTWALLETD=... CHAIN_DIR=/tmp/zchain \
+ZEBRAD=$PWD/zebrad/bin/zebrad LIGHTWALLETD=$PWD/lightwalletd/bin/lightwalletd CHAIN_DIR=/tmp/zchain \
   ../tools/regtest/chain.sh prepare "$(jq -r .orchardUa keys.json)" "$(jq -r .transparent keys.json)"
 REGTEST_HEIGHTS=../tools/regtest/regtest.json REGTEST_PHRASE=phrase.txt \
 REGTEST_RPC=http://127.0.0.1:28232 REGTEST_SERVERS=http://127.0.0.1:29061,http://127.0.0.1:29063 \
