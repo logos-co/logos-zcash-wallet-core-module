@@ -3982,6 +3982,7 @@ dependencies = [
  "secrecy 0.8.0",
  "serde",
  "serde_json",
+ "shardtree",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

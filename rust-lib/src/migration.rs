@@ -8,7 +8,7 @@
 use rand::SeedableRng;
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use zcash_client_backend::data_api::{Account as _, AccountSource, WalletRead};
+use zcash_client_backend::data_api::{Account as _, AccountSource, WalletCommitmentTrees, WalletRead};
 use zcash_client_backend::util::SystemClock;
 use zcash_client_sqlite::pool_migration::orchard_ironwood::PoolMigrations;
 use zcash_client_sqlite::AccountUuid;
@@ -20,7 +20,7 @@ use zcash_pool_migration::engine::{
 use zcash_pool_migration::satisfiability::{advance_migration, AdvanceConfig, DuenessTargets, ReorgSettleDepth, ReplanThreshold};
 use zcash_pool_migration::state::{AdvanceStep, StepKind};
 use zcash_pool_migration::wallet::{WalletMigration, WalletMigrationProver};
-use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
 use crate::keys::Phrase;
 use crate::network::ZNetwork;
@@ -156,6 +156,7 @@ pub fn drive(
     let scanned = db.block_fully_scanned().map_err(|e| e.to_string())?.ok_or("the wallet has not scanned yet")?.block_height();
     let tip = db.chain_height().map_err(|e| e.to_string())?.ok_or("the wallet is not synced")?;
     let targets = DuenessTargets::new(scanned + 1, tip + 1);
+    let prep_anchor = checkpoint_at_or_below(db, scanned)?.unwrap_or(scanned);
     let config = AdvanceConfig::new(REORG_SETTLE_DEPTH);
     let mut rng = rng();
 
@@ -174,7 +175,7 @@ pub fn drive(
                     let mut prover = WalletMigrationProver::new(&mut *db, rng.clone(), account, fvk.clone());
                     match target.kind() {
                         MigrationTxKind::Transfer { .. } => prove_transfer(&params, &mut prover, &mut state, id, scanned, &mut rng),
-                        MigrationTxKind::Preparation { .. } => prove_preparation(&mut prover, &mut state, id, scanned),
+                        MigrationTxKind::Preparation { .. } => prove_preparation(&mut prover, &mut state, id, prep_anchor),
                     }
                     .map_err(|e| format!("proving {}: {e}", u32::from(id)))?
                 };
@@ -212,6 +213,26 @@ pub fn drive(
         AdvanceStep::Waiting => Ok(Drive::Waiting(advance.next().map(|(h, _)| u32::from(h)))),
         AdvanceStep::Complete => Ok(Drive::Complete),
     }
+}
+
+/// The highest Orchard checkpoint at or below `height`. Scanning checkpoints a block only at its
+/// last note commitment (and on the ZIP 318 grid), so a block without shielded outputs has none.
+fn checkpoint_at_or_below(db: &mut Db, height: BlockHeight) -> Result<Option<BlockHeight>, String> {
+    use shardtree::{error::ShardTreeError, store::ShardStore};
+    db.with_orchard_tree_mut::<_, _, ShardTreeError<_>>(|tree| {
+        let mut best = None;
+        // The store binds the limit as an SQL integer; ~100 recent plus the durable grid ones exist.
+        tree.store()
+            .for_each_checkpoint(100_000, |id, _| {
+                if *id <= height {
+                    best = Some(*id);
+                }
+                Ok(())
+            })
+            .map_err(ShardTreeError::Storage)?;
+        Ok(best)
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Status for the app: the run's summary and what it waits for.
