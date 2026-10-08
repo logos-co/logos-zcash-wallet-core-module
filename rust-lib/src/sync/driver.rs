@@ -1,7 +1,7 @@
 //! The sync driver. It runs on the wallet thread, one bounded step at a time, so
 //! commands and cancellation are handled between steps.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -95,7 +95,8 @@ pub enum Step {
 
 enum Msg {
     Chunk(u32, Result<Chunk, NetError>),
-    Head(u32, Result<Vec<CompactBlock>, NetError>),
+    /// A cached chunk's missing blocks: chunk start, first height, result.
+    Tail(u32, u32, Result<Vec<CompactBlock>, NetError>),
     Tip(Result<(u32, LightdInfo), NetError>),
     Enhanced(TransactionDataRequest, Result<Fetched, NetError>),
 }
@@ -110,8 +111,7 @@ pub struct Syncer {
     in_flight: BTreeSet<u32>,
     /// Failed downloads wait before the next try: failures so far and the time to retry.
     retry: HashMap<u32, (u32, Instant)>,
-    head_retry: (u32, Option<Instant>),
-    head_in_flight: bool,
+    tails_in_flight: BTreeSet<u32>,
     tip_in_flight: bool,
     last_tip_poll: Option<Instant>,
     tip: Option<u32>,
@@ -149,8 +149,7 @@ impl Syncer {
             rx,
             in_flight: BTreeSet::new(),
             retry: HashMap::new(),
-            head_retry: (0, None),
-            head_in_flight: false,
+            tails_in_flight: BTreeSet::new(),
             tip_in_flight: false,
             last_tip_poll: None,
             tip: None,
@@ -195,7 +194,7 @@ impl Syncer {
         let worked = self.scan_once(db, tip)?;
         self.progress.fully_scanned = db.block_fully_scanned().map_err(db_err)?.map(|m| u32::from(m.block_height()));
         self.update_eta(db, tip)?;
-        self.progress.downloads_in_flight = self.in_flight.len() + usize::from(self.head_in_flight);
+        self.progress.downloads_in_flight = self.in_flight.len() + self.tails_in_flight.len();
         if worked {
             self.progress.state = "scanning".into();
             return Ok(Step::Worked);
@@ -260,19 +259,18 @@ impl Syncer {
                     Err(e) => self.progress.last_error = Some(e.to_string()),
                 }
             }
-            Msg::Head(first, r) => {
-                self.head_in_flight = false;
+            Msg::Tail(start, first, r) => {
+                self.tails_in_flight.remove(&start);
                 match r {
                     Ok(blocks) => {
-                        self.head_retry = (0, None);
+                        self.retry.remove(&start);
                         self.progress.blocks_fetched += blocks.len() as u64;
-                        let _ = first;
                         self.cache.insert_blocks(&blocks)?;
                     }
                     Err(e) => {
-                        let failures = self.head_retry.0 + 1;
-                        tracing::warn!(target: "zcash", "head from {first}: {e} (failure {failures})");
-                        self.head_retry = (failures, Some(Instant::now() + retry_delay(failures)));
+                        let failures = self.retry.get(&start).map_or(0, |r| r.0) + 1;
+                        tracing::warn!(target: "zcash", "blocks from {first}: {e} (failure {failures})");
+                        self.retry.insert(start, (failures, Instant::now() + retry_delay(failures)));
                         self.progress.last_error = Some(e.to_string());
                     }
                 }
@@ -357,9 +355,9 @@ impl Syncer {
         Ok(())
     }
 
-    /// Chunks still needed, from the tip down: those overlapping an unscanned range.
-    fn needed_chunks(&self, db: &Db, tip: u32) -> Result<Vec<u32>, SyncError> {
-        let mut starts = BTreeSet::new();
+    /// Chunks still needed, from the tip down, each with the first height it lacks a scan for.
+    fn needed_chunks(&self, db: &Db, tip: u32) -> Result<Vec<(u32, u32)>, SyncError> {
+        let mut starts: BTreeMap<u32, u32> = BTreeMap::new();
         for r in db.suggest_scan_ranges().map_err(db_err)? {
             if matches!(r.priority(), ScanPriority::Scanned | ScanPriority::Ignored) {
                 continue;
@@ -367,7 +365,8 @@ impl Syncer {
             let (s, e) = (u32::from(r.block_range().start), u32::from(r.block_range().end).min(tip + 1));
             let mut c = grid_floor(s);
             while c < e {
-                starts.insert(c);
+                let from = s.max(chunk_first(c));
+                starts.entry(c).and_modify(|f| *f = (*f).min(from)).or_insert(from);
                 c += GRID;
             }
         }
@@ -376,27 +375,37 @@ impl Syncer {
 
     fn plan_downloads(&mut self, db: &Db, tip: u32) -> Result<(), SyncError> {
         let tip_chunk = grid_floor(tip);
-        // The tip chunk grows block by block; fetch what is new since last time.
-        let head_due = self.head_retry.1.is_none_or(|t| Instant::now() >= t);
-        if !self.head_in_flight && head_due && self.cache.chunk_end(tip_chunk)?.is_some() {
-            let have = self.cache.contiguous_end(chunk_first(tip_chunk))?;
-            if have <= tip {
-                self.head_in_flight = true;
+        let needed = self.needed_chunks(db, tip)?;
+        // A cached chunk grows from its first missing block: the tip chunk up to the tip, and a
+        // chunk the tip has moved past (or a wallet reopened later) up to its grid line.
+        for &(start, from) in &needed {
+            if self.tails_in_flight.len() >= self.cfg.parallel {
+                break;
+            }
+            if self.tails_in_flight.contains(&start) || self.cache.chunk_end(start)?.is_none() {
+                continue;
+            }
+            if self.retry.get(&start).is_some_and(|r| Instant::now() < r.1) {
+                continue;
+            }
+            let last = if start == tip_chunk { tip } else { start + GRID - 1 };
+            let have = self.cache.contiguous_end(from)?;
+            if have <= last {
+                self.tails_in_flight.insert(start);
                 let (server, proxy, tx) = (self.server_for(), self.cfg.proxy.clone(), self.tx.clone());
                 self.rt.spawn(async move {
-                    let _ = tx.send(Msg::Head(have, fetch::fetch_blocks(&server, &proxy, have, tip).await));
+                    let _ = tx.send(Msg::Tail(start, have, fetch::fetch_blocks(&server, &proxy, have, last).await));
                 });
             }
         }
-        let needed = self.needed_chunks(db, tip)?;
         let mut cached = 0;
-        for &start in &needed {
+        for &(start, _) in &needed {
             if self.cache.chunk_end(start)?.is_some() {
                 cached += 1;
             }
         }
         self.progress.chunks_cached = cached;
-        for start in needed {
+        for (start, _) in needed {
             if self.in_flight.len() >= self.cfg.parallel || cached + self.in_flight.len() >= self.cfg.ahead {
                 break;
             }
