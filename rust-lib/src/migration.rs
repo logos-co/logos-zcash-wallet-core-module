@@ -52,7 +52,7 @@ fn ufvk(db: &Db, account: AccountUuid) -> Result<zcash_keys::keys::UnifiedFullVi
 fn nu7_height(params: &ZNetwork) -> Option<u32> {
     params.activation_height(NetworkUpgrade::Nu7).map(u32::from).or(match params {
         ZNetwork::Main => Some(MAINNET_NU7_ESTIMATE),
-        ZNetwork::Test => None,
+        ZNetwork::Test | ZNetwork::Regtest => None,
     })
 }
 

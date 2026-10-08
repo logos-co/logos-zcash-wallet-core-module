@@ -56,6 +56,7 @@ pub fn all(network: ZNetwork) -> Vec<Checkpoint> {
     let raw = match network {
         ZNetwork::Main => MAINNET,
         ZNetwork::Test => TESTNET,
+        ZNetwork::Regtest => "[]",
     };
     serde_json::from_str(raw).unwrap_or_default()
 }

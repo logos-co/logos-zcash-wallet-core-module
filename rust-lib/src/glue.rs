@@ -190,6 +190,13 @@ impl ZcashWalletCoreModule for ZcashWalletCoreModuleImpl {
         let dir = std::path::PathBuf::from(&ctx.instance_persistence_path);
         crate::storage::init_log(&dir);
         let callers = std::fs::read_to_string(dir.join("callers.json")).ok();
+        // A local test chain's upgrade heights, for test harnesses only.
+        if let Some(h) = std::fs::read_to_string(dir.join("regtest.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<crate::network::RegtestHeights>(&t).ok())
+        {
+            crate::network::configure_regtest(&h);
+        }
         *self.callers.lock().unwrap() = Callers::from_file(callers.as_deref());
         let sink: Sink = Arc::new(|ev| match ev {
             Event::WalletState(v) => emit_wallet_state_changed(&v.to_string()),

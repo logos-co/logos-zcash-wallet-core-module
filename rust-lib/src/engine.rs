@@ -49,6 +49,13 @@ impl Routes {
         if self.servers.is_empty() {
             return Err("no servers".into());
         }
+        // A regtest chain may use a loopback lightwalletd without Tor or TLS.
+        if self.proxy == "direct" {
+            if !crate::network::regtest_configured() || self.servers.iter().any(|s| !s.starts_with("http://127.0.0.1:")) {
+                return Err("a direct connection is only for a loopback regtest server".into());
+            }
+            return Ok(SyncConfig::new(ProxyAddr::direct(), self.servers.clone()));
+        }
         if self.servers.iter().any(|s| !s.starts_with("https://")) {
             return Err("servers must be https:// URLs".into());
         }

@@ -22,6 +22,15 @@ pub struct ProxyAddr {
 }
 
 impl ProxyAddr {
+    /// No proxy: a loopback lightwalletd on a regtest chain. Nothing else may use it.
+    pub fn direct() -> Self {
+        Self { host: "direct".into(), port: 0 }
+    }
+
+    pub fn is_direct(&self) -> bool {
+        self.host == "direct" && self.port == 0
+    }
+
     pub fn parse(url: &str) -> Result<Self, String> {
         let rest = url
             .strip_prefix(SCHEME)
@@ -30,7 +39,7 @@ impl ProxyAddr {
         let (host, port) = rest
             .rsplit_once(':')
             .ok_or_else(|| "proxy needs a port".to_string())?;
-        let port = port.parse::<u16>().map_err(|_| "bad proxy port".to_string())?;
+        let port = port.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(|| "bad proxy port".to_string())?;
         if host.is_empty() {
             return Err("proxy needs a host".into());
         }
@@ -113,6 +122,7 @@ mod tests {
         assert!(ProxyAddr::parse("socks5://127.0.0.1:9050").is_err());
         assert!(ProxyAddr::parse("http://127.0.0.1:8118").is_err());
         assert!(ProxyAddr::parse("socks5h://127.0.0.1").is_err());
+        assert!(ProxyAddr::parse("socks5h://direct:0").is_err());
     }
 
     #[test]

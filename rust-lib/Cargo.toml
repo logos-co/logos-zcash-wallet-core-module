@@ -23,7 +23,7 @@ zcash_client_backend = { version = "=0.25.0-pre.1", default-features = false, fe
 ] }
 zcash_client_sqlite = { version = "=0.23.0-pre.1", features = ["orchard", "transparent-inputs"] }
 zcash_keys = { version = "=0.17.0-pre.1", features = ["orchard", "transparent-inputs"] }
-zcash_protocol = "=0.11.0-pre.0"
+zcash_protocol = { version = "=0.11.0-pre.0", features = ["local-consensus"] }
 zcash_primitives = "=0.31.0-pre.1"
 zcash_proofs = { version = "=0.31.0-pre.1", default-features = false, features = ["local-prover", "multicore"] }
 zcash_pool_migration = { version = "=0.2.0-pre.1", features = ["wallet"] }
