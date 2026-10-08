@@ -1,6 +1,7 @@
 name: Unit tests
 
-# Plain cargo: --no-default-features drops the module glue and the SDK path dependency.
+# Plain cargo: --no-default-features drops the module glue. Cargo still reads the optional
+# SDK path dependency's manifest, so the SDK is checked out at the revision the builder pins.
 
 on:
   pull_request:
@@ -18,6 +19,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Find the SDK revision the builder pins
+        id: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev=$(jq -r '.nodes as $n | ($n[.root].inputs["logos-module-builder"]) as $b
+                       | $n[$n[$b].inputs["logos-rust-sdk"]].locked.rev' flake.lock)
+          [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no SDK pin in flake.lock ($rev)"; exit 1; }
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: logos-co/logos-rust-sdk
+          ref: ${{ steps.sdk.outputs.rev }}
+          path: logos-rust-sdk-src
 
       - uses: dtolnay/rust-toolchain@master
         with:
