@@ -18,6 +18,14 @@ use crate::storage::{open_encrypted, StorageError};
 use crate::sync::cache::{BlockCache, CacheError};
 
 pub type Db = WalletDb<rusqlite::Connection, ZNetwork, SystemClock, ChaCha20Rng>;
+/// A wallet database over any form of connection.
+pub type WalletDbOf<C> = WalletDb<C, ZNetwork, SystemClock, ChaCha20Rng>;
+/// A read-only view over a borrowed connection.
+pub type DbRef<'a> = WalletDb<&'a rusqlite::Connection, ZNetwork, SystemClock, ChaCha20Rng>;
+
+pub fn borrow_db(conn: &rusqlite::Connection, network: ZNetwork) -> DbRef<'_> {
+    WalletDb::from_connection(conn, network, SystemClock, new_rng())
+}
 
 const META: &str = "wallet.json";
 const SEED: &str = "seed.age";
@@ -144,6 +152,10 @@ impl WalletDir {
     pub fn open_db(&self, network: ZNetwork, key: &[u8; 32]) -> Result<Db, WalletError> {
         let conn = open_encrypted(&self.path.join(DB), key)?;
         Ok(Db::from_connection(conn, network, SystemClock, new_rng()))
+    }
+
+    pub fn open_conn(&self, key: &[u8; 32]) -> Result<rusqlite::Connection, WalletError> {
+        Ok(open_encrypted(&self.path.join(DB), key)?)
     }
 
     pub fn open_cache(&self, key: &[u8; 32]) -> Result<BlockCache, WalletError> {

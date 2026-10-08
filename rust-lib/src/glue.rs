@@ -39,6 +39,9 @@ pub trait ZcashWalletCoreModule: Send + Sync + 'static {
     fn addresses(&self, account: String) -> String;
     /// A new diversified shielded address.
     fn new_address(&self, account: String) -> String;
+    /// `{ ok, page, pageSize, rows: [{ txid, kind: received|sent|shielded|migration, height,
+    /// pending, expired, expiryHeight, time, delta, fee, pools, memos, to, amountMadePublic }] }`.
+    fn history(&self, account: String, page: i64) -> String;
     /// The recovery phrase, once, after checking the password.
     fn reveal_seed(&self, password: String) -> String;
     /// The account's Unified Full Viewing Key, after checking the password.
@@ -149,6 +152,10 @@ impl ZcashWalletCoreModule for ZcashWalletCoreModuleImpl {
 
     fn new_address(&self, _account: String) -> String {
         self.gated(|e| e.new_address())
+    }
+
+    fn history(&self, _account: String, page: i64) -> String {
+        self.gated(|e| e.history(page.clamp(0, u32::MAX as i64) as u32))
     }
 
     fn reveal_seed(&self, password: String) -> String {

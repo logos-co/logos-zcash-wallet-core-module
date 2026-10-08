@@ -26,7 +26,7 @@ use crate::network::ZNetwork;
 use crate::sync::cache::grid_floor;
 use crate::sync::driver::{Progress, Step, SyncConfig, Syncer, HEAD};
 use crate::sync::fetch;
-use crate::wallet::{self, Db, Meta, WalletDir};
+use crate::wallet::{self, borrow_db, Db, Meta, WalletDir};
 
 pub enum Event {
     WalletState(Value),
@@ -156,7 +156,7 @@ struct OpenWallet {
     network: ZNetwork,
     account: AccountUuid,
     dir: WalletDir,
-    reader: Mutex<Db>,
+    reader: Mutex<rusqlite::Connection>,
     cmd: Sender<WalletCmd>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -328,7 +328,7 @@ impl Engine {
         let account = dir.account().map_err(|e| e.to_string())?;
         let key = dir.unlock_db_key(password).map_err(|e| e.to_string())?;
         let writer = dir.open_db(network, &key).map_err(|e| e.to_string())?;
-        let reader = dir.open_db(network, &key).map_err(|e| e.to_string())?;
+        let reader = dir.open_conn(&key).map_err(|e| e.to_string())?;
         let cache = Arc::new(dir.open_cache(&key).map_err(|e| e.to_string())?);
         drop(key);
 
@@ -464,15 +464,16 @@ impl Engine {
 
     pub fn balances(&self) -> Value {
         let r = self.with_open(|w| {
-            let db = w.reader.lock().unwrap();
-            balances_json(&db, w.account)
+            let conn = w.reader.lock().unwrap();
+            balances_json(&borrow_db(&conn, w.network), w.account)
         });
         r.unwrap_or_else(|e| json!({"ok": false, "error": e}))
     }
 
     pub fn addresses(&self) -> Value {
         let r = self.with_open(|w| {
-            let db = w.reader.lock().unwrap();
+            let conn = w.reader.lock().unwrap();
+            let db = borrow_db(&conn, w.network);
             let ua = db
                 .get_last_generated_address_matching(w.account, UnifiedAddressRequest::SHIELDED)
                 .map_err(|e| e.to_string())?;
@@ -507,6 +508,16 @@ impl Engine {
         }
     }
 
+    /// Newest first. Each row: txid, kind, height or pending, delta, fee, pools,
+    /// memos, the amount that crossed pools publicly, and expiry for unmined sends.
+    pub fn history(&self, page: u32) -> Value {
+        let r = self.with_open(|w| {
+            let conn = w.reader.lock().unwrap();
+            crate::history::page(&conn, w.network, w.account, page)
+        });
+        r.unwrap_or_else(|e| json!({"ok": false, "error": e}))
+    }
+
     pub fn reveal_seed(&self, password: &str) -> Value {
         let r = self.with_open(|w| {
             let phrase = w.dir.unseal_phrase(password).map_err(|e| e.to_string())?;
@@ -518,7 +529,8 @@ impl Engine {
     pub fn export_viewing_key(&self, password: &str) -> Value {
         let r = self.with_open(|w| {
             w.dir.unlock_db_key(password).map_err(|e| e.to_string())?;
-            let db = w.reader.lock().unwrap();
+            let conn = w.reader.lock().unwrap();
+            let db = borrow_db(&conn, w.network);
             let account = db.get_account(w.account).map_err(|e| e.to_string())?.ok_or("account missing")?;
             let ufvk = account.ufvk().ok_or("this account has no full viewing key")?;
             let encoded = ufvk.encode(&w.network).map_err(|e| format!("{e:?}"))?;
@@ -541,7 +553,7 @@ fn pool_json(b: &zcash_client_backend::data_api::Balance) -> Value {
     })
 }
 
-fn balances_json(db: &Db, account: AccountUuid) -> Result<Value, String> {
+fn balances_json<C: std::borrow::Borrow<rusqlite::Connection>>(db: &wallet::WalletDbOf<C>, account: AccountUuid) -> Result<Value, String> {
     let Some(summary) = db.get_wallet_summary(ConfirmationsPolicy::default()).map_err(|e| e.to_string())? else {
         return Ok(json!({"ok": true, "ready": false}));
     };
@@ -569,7 +581,7 @@ fn balances_json(db: &Db, account: AccountUuid) -> Result<Value, String> {
 }
 
 /// Transparent funds per address, for a Shield action each (ZIP 315: never linked).
-fn transparent_funds(db: &Db, account: AccountUuid, tip: zcash_protocol::consensus::BlockHeight) -> Result<Value, String> {
+fn transparent_funds<C: std::borrow::Borrow<rusqlite::Connection>>(db: &wallet::WalletDbOf<C>, account: AccountUuid, tip: zcash_protocol::consensus::BlockHeight) -> Result<Value, String> {
     use zcash_keys::encoding::AddressCodec;
     let balances = db
         .get_transparent_balances(account, (tip + 1).into(), ConfirmationsPolicy::default())
@@ -585,7 +597,7 @@ fn transparent_funds(db: &Db, account: AccountUuid, tip: zcash_protocol::consens
 
 /// The lowest-index external transparent address. Rotation after a payment comes
 /// with the Receive tab work.
-fn first_external_transparent(db: &Db, account: AccountUuid) -> Result<Option<String>, String> {
+fn first_external_transparent<C: std::borrow::Borrow<rusqlite::Connection>>(db: &wallet::WalletDbOf<C>, account: AccountUuid) -> Result<Option<String>, String> {
     use zcash_keys::encoding::AddressCodec;
     let receivers = db.get_transparent_receivers(account, false, false).map_err(|e| e.to_string())?;
     let mut best: Option<(u32, String)> = None;

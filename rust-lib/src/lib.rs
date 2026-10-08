@@ -3,6 +3,7 @@
 pub mod checkpoints;
 pub mod engine;
 pub mod gate;
+pub mod history;
 pub mod jobs;
 pub mod keys;
 pub mod net;
