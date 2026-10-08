@@ -145,6 +145,9 @@ pub enum Drive {
 
 /// Runs one step of the ZIP 318 drive loop. `broadcast` submits raw bytes and returns
 /// whether the node accepted them, and its answer.
+/// At most this many proofs per drive, so wallet reads are not kept waiting.
+const PROOFS_PER_DRIVE: usize = 2;
+
 pub fn drive(
     db: &mut Db,
     conn: &mut Connection,
@@ -169,7 +172,8 @@ pub fn drive(
     match advance.step() {
         AdvanceStep::Prove { transactions } => {
             let mut proved = 0;
-            for target in transactions {
+            // A proof takes seconds on the wallet thread; the rest wait for the next drive.
+            for target in transactions.into_iter().take(PROOFS_PER_DRIVE) {
                 let id = target.id();
                 let outcome = {
                     let mut prover = WalletMigrationProver::new(&mut *db, rng.clone(), account, fvk.clone());
