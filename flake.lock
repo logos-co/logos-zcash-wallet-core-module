@@ -6144,6 +6144,34 @@
         "type": "github"
       }
     },
+    "logos-zebra-nix": {
+      "inputs": {
+        "logos-nix": [
+          "zebrad_module",
+          "logos-module-builder",
+          "logos-nix"
+        ],
+        "nixpkgs": [
+          "zebrad_module",
+          "logos-module-builder",
+          "nixpkgs"
+        ],
+        "rust-overlay": "rust-overlay_4"
+      },
+      "locked": {
+        "lastModified": 1791456664,
+        "narHash": "sha256-dZ13hsvZH+p50+gLS6yUNGFRveos8E8eS4c9qmCUqW4=",
+        "owner": "logos-co",
+        "repo": "logos-zebra-nix",
+        "rev": "dd35e5c71e5f86d806cd4d58b8e409c936f99008",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-zebra-nix",
+        "type": "github"
+      }
+    },
     "nix-bundle-appimage": {
       "inputs": {
         "logos-nix": [
@@ -9600,7 +9628,8 @@
     },
     "root": {
       "inputs": {
-        "logos-module-builder": "logos-module-builder"
+        "logos-module-builder": "logos-module-builder",
+        "zebrad_module": "zebrad_module"
       }
     },
     "rust-overlay": {
@@ -9671,6 +9700,49 @@
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "rust-overlay_4": {
+      "inputs": {
+        "nixpkgs": [
+          "zebrad_module",
+          "logos-zebra-nix",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1787713867,
+        "narHash": "sha256-ZRYTEvDb8QZLCHRoMyIZle9V3Bvw905m0teeo1RvI7M=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "494680f9ffa2b4bf9f2df0f442c7096e44adfa00",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "zebrad_module": {
+      "inputs": {
+        "logos-module-builder": [
+          "logos-module-builder"
+        ],
+        "logos-zebra-nix": "logos-zebra-nix"
+      },
+      "locked": {
+        "lastModified": 1791456750,
+        "narHash": "sha256-s4qvQvHw03GmACMj2G5eNOPUeX2zUFSdONLbUXVVHzg=",
+        "owner": "logos-co",
+        "repo": "logos-zebrad-module",
+        "rev": "9b9e84f9daeffd5b8f6cf93e4c5b623b9d1605a8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-zebrad-module",
         "type": "github"
       }
     }

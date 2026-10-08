@@ -3,6 +3,11 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+    # OPTIONAL in metadata.json: only its contract is consumed.
+    zebrad_module = {
+      url = "github:logos-co/logos-zebrad-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
