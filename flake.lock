@@ -9733,11 +9733,11 @@
         "logos-zebra-nix": "logos-zebra-nix"
       },
       "locked": {
-        "lastModified": 1791460257,
-        "narHash": "sha256-h8wKw/oqwFILMcKQa+2JIEgdh457NGijBeDK6WgI7IU=",
+        "lastModified": 1791467372,
+        "narHash": "sha256-YevJL9mlH4pR9kz5sclU1yOH787J9VVEgxbzcEcCkJo=",
         "owner": "logos-co",
         "repo": "logos-zebrad-module",
-        "rev": "5b2ca97819ded59c63855815eb319d3cdb7ac105",
+        "rev": "41f1e4294d04a840af2cbd90c4b5c9bd3057a4cb",
         "type": "github"
       },
       "original": {
