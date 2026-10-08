@@ -25,7 +25,7 @@ use crate::net::ipc::LOCAL_NODE_URL;
 use crate::net::socks::ProxyAddr;
 use crate::network::ZNetwork;
 use crate::sync::cache::grid_floor;
-use crate::sync::driver::{Progress, Step, SyncConfig, Syncer, HEAD};
+use crate::sync::driver::{ErrorSource, Progress, Step, SyncConfig, Syncer, HEAD};
 use crate::sync::fetch;
 use crate::wallet::{self, borrow_db, Db, Meta, WalletDir};
 
@@ -878,12 +878,14 @@ fn wallet_loop(
             Err(e) => Err(e),
         };
         if let Err(e) = stepped {
-            syncer.progress.last_error = Some(e.to_string());
+            syncer.fail(ErrorSource::Step, e);
             let until = Instant::now() + backoff;
             while Instant::now() < until && !stop.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(100));
             }
             backoff = (backoff * 2).min(Duration::from_secs(60));
+        } else {
+            syncer.succeed(ErrorSource::Step);
         }
         *progress.lock().unwrap() = syncer.progress.clone();
         if last_emit.elapsed() >= Duration::from_secs(1) {
@@ -910,7 +912,11 @@ fn wallet_loop(
                     .map(|(code, msg)| (code == 0, msg))
                     .map_err(|e| e.to_string())
             };
-            match crate::migration::drive(&mut db, &mut mig_conn, params, account, &mut send) {
+            let driven = crate::migration::drive(&mut db, &mut mig_conn, params, account, &mut send);
+            if driven.is_ok() {
+                syncer.succeed(ErrorSource::Migration);
+            }
+            match driven {
                 Ok(crate::migration::Drive::None) | Ok(crate::migration::Drive::Waiting(_)) => {}
                 Ok(crate::migration::Drive::NeedsApproval(why)) => {
                     if blocker != Some(why) {
@@ -926,10 +932,10 @@ fn wallet_loop(
                 }
                 Err(e) => {
                     let e = format!("migration: {e}");
-                    if syncer.progress.last_error.as_deref() != Some(e.as_str()) {
+                    if syncer.error(ErrorSource::Migration) != Some(e.as_str()) {
                         tracing::warn!(target: "zcash", "{e}");
                     }
-                    syncer.progress.last_error = Some(e);
+                    syncer.fail(ErrorSource::Migration, e);
                 }
             }
         }

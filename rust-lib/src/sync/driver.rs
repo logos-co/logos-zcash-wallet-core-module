@@ -110,6 +110,52 @@ enum Msg {
     Received(TransparentAddress, u32, Result<Vec<(Transaction, Option<BlockHeight>)>, NetError>),
 }
 
+/// What a sync error came from. The next success of the same source clears it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ErrorSource {
+    Tip,
+    Chunk(u32),
+    Tail(u32),
+    Details,
+    Transparent,
+    /// A chain that changed under the scan.
+    Scan,
+    /// The engine's: a failed step, and the migration.
+    Step,
+    Migration,
+}
+
+/// Errors by source, so the one shown is the newest that still stands.
+#[derive(Default)]
+struct Errors {
+    by_source: HashMap<ErrorSource, (u64, String)>,
+    seq: u64,
+}
+
+impl Errors {
+    fn set(&mut self, source: ErrorSource, e: String) {
+        self.seq += 1;
+        self.by_source.insert(source, (self.seq, e));
+    }
+
+    fn clear(&mut self, source: ErrorSource) {
+        self.by_source.remove(&source);
+    }
+
+    fn get(&self, source: ErrorSource) -> Option<&str> {
+        self.by_source.get(&source).map(|(_, e)| e.as_str())
+    }
+
+    /// Once synced, downloads and scans that failed on the way are moot.
+    fn clear_moot(&mut self) {
+        self.by_source.retain(|s, _| !matches!(s, ErrorSource::Chunk(_) | ErrorSource::Tail(_) | ErrorSource::Scan));
+    }
+
+    fn latest(&self) -> Option<String> {
+        self.by_source.values().max_by_key(|(seq, _)| *seq).map(|(_, e)| e.clone())
+    }
+}
+
 pub struct Syncer {
     params: ZNetwork,
     cfg: SyncConfig,
@@ -138,6 +184,7 @@ pub struct Syncer {
     t_pause: Option<Instant>,
     /// When scanning began this session, and how many blocks since, for the ETA.
     pace: Option<(Instant, u64)>,
+    errors: Errors,
     pub progress: Progress,
 }
 
@@ -178,8 +225,25 @@ impl Syncer {
             t_failures: 0,
             t_pause: None,
             pace: None,
+            errors: Errors::default(),
             progress: Progress { state: "starting".into(), birthday, ..Default::default() },
         }
+    }
+
+    /// Records an error that `last_error` shows until its source next succeeds.
+    pub fn fail(&mut self, source: ErrorSource, e: impl std::fmt::Display) {
+        self.errors.set(source, e.to_string());
+        self.progress.last_error = self.errors.latest();
+    }
+
+    pub fn succeed(&mut self, source: ErrorSource) {
+        self.errors.clear(source);
+        self.progress.last_error = self.errors.latest();
+    }
+
+    /// The error `source` last recorded, while it stands.
+    pub fn error(&self, source: ErrorSource) -> Option<&str> {
+        self.errors.get(source)
     }
 
     fn server_for(&mut self) -> String {
@@ -220,6 +284,10 @@ impl Syncer {
         }
         self.plan_enhancements(db, tip)?;
         let synced = self.progress.fully_scanned.is_some_and(|h| h >= tip) && self.in_flight.is_empty();
+        if synced {
+            self.errors.clear_moot();
+            self.progress.last_error = self.errors.latest();
+        }
         self.progress.state = if synced { "synced" } else { "downloading" }.into();
         Ok(if synced { Step::Synced } else { Step::Waiting })
     }
@@ -243,16 +311,21 @@ impl Syncer {
                 self.tip_in_flight = false;
                 match r {
                     Ok((tip, info)) => {
-                        self.check_server(&self.cfg.servers[0].clone(), &info, tip)?;
+                        // Under the tip's source too, so it stays shown while every poll gives it.
+                        if let Err(e) = self.check_server(&self.cfg.servers[0].clone(), &info, tip) {
+                            self.fail(ErrorSource::Tip, &e);
+                            return Err(e);
+                        }
                         if self.tip.is_none_or(|t| t != tip) {
                             db.update_chain_tip(BlockHeight::from(tip)).map_err(db_err)?;
                             self.tip = Some(tip);
                         }
                         self.progress.tip = Some(tip);
+                        self.succeed(ErrorSource::Tip);
                     }
                     Err(e) => {
                         tracing::warn!(target: "zcash", "tip poll: {e}");
-                        self.progress.last_error = Some(e.to_string());
+                        self.fail(ErrorSource::Tip, e);
                     }
                 }
             }
@@ -261,21 +334,25 @@ impl Syncer {
                 match r {
                     Ok(chunk) => {
                         self.retry.remove(&start);
+                        self.succeed(ErrorSource::Chunk(start));
                         self.store_chunk(chunk)?
                     }
                     Err(e) => {
                         let failures = self.retry.get(&start).map_or(0, |r| r.0) + 1;
                         tracing::warn!(target: "zcash", "chunk {start}: {e} (failure {failures})");
                         self.retry.insert(start, (failures, Instant::now() + retry_delay(failures)));
-                        self.progress.last_error = Some(e.to_string());
+                        self.fail(ErrorSource::Chunk(start), e);
                     }
                 }
             }
             Msg::Enhanced(req, r) => {
                 self.enh_in_flight.remove(&req);
                 match r {
-                    Ok(fetched) => self.apply_enhancement(db, req, fetched)?,
-                    Err(e) => self.progress.last_error = Some(e.to_string()),
+                    Ok(fetched) => {
+                        self.succeed(ErrorSource::Details);
+                        self.apply_enhancement(db, req, fetched)?
+                    }
+                    Err(e) => self.fail(ErrorSource::Details, e),
                 }
             }
             Msg::Received(address, upto, r) => {
@@ -287,12 +364,13 @@ impl Syncer {
                         }
                         self.t_checked.insert(address, upto);
                         self.t_failures = 0;
+                        self.succeed(ErrorSource::Transparent);
                     }
                     Err(e) => {
                         self.t_failures += 1;
                         tracing::warn!(target: "zcash", "transparent lookup: {e} (failure {})", self.t_failures);
                         self.t_pause = Some(Instant::now() + retry_delay(self.t_failures));
-                        self.progress.last_error = Some(e.to_string());
+                        self.fail(ErrorSource::Transparent, e);
                     }
                 }
             }
@@ -301,6 +379,7 @@ impl Syncer {
                 match r {
                     Ok(blocks) => {
                         self.retry.remove(&start);
+                        self.succeed(ErrorSource::Tail(start));
                         self.progress.blocks_fetched += blocks.len() as u64;
                         self.cache.insert_blocks(&blocks)?;
                     }
@@ -308,7 +387,7 @@ impl Syncer {
                         let failures = self.retry.get(&start).map_or(0, |r| r.0) + 1;
                         tracing::warn!(target: "zcash", "blocks from {first}: {e} (failure {failures})");
                         self.retry.insert(start, (failures, Instant::now() + retry_delay(failures)));
-                        self.progress.last_error = Some(e.to_string());
+                        self.fail(ErrorSource::Tail(start), e);
                     }
                 }
             }
@@ -651,6 +730,7 @@ impl Syncer {
         match scan_cached_blocks(&self.params, self.cache.as_ref(), db, BlockHeight::from(start), &state, limit) {
             Ok(_) => {
                 self.last_end = frontier::advance(&state, &blocks).ok();
+                self.succeed(ErrorSource::Scan);
                 self.progress.blocks_scanned += limit as u64;
                 self.progress.outputs_scanned += outputs as u64;
                 Ok(())
@@ -662,7 +742,7 @@ impl Syncer {
                 let rewound = db.truncate_to_height(target).map_err(db_err)?;
                 self.cache.truncate_from(u32::from(rewound) + 1)?;
                 self.last_end = None;
-                self.progress.last_error = Some(format!("chain changed at {at}; rewound to {}", u32::from(rewound)));
+                self.fail(ErrorSource::Scan, format!("chain changed at {at}; rewound to {}", u32::from(rewound)));
                 Ok(())
             }
             Err(e) => Err(SyncError::Db(e.to_string())),
@@ -673,6 +753,33 @@ impl Syncer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_stands_until_its_source_succeeds() {
+        let mut e = Errors::default();
+        e.set(ErrorSource::Tip, "tip poll failed".into());
+        e.set(ErrorSource::Chunk(1000), "chunk 1000 failed".into());
+        assert_eq!(e.latest().as_deref(), Some("chunk 1000 failed"));
+        e.clear(ErrorSource::Chunk(2000));
+        assert_eq!(e.latest().as_deref(), Some("chunk 1000 failed"), "another chunk's success");
+        e.clear(ErrorSource::Chunk(1000));
+        assert_eq!(e.latest().as_deref(), Some("tip poll failed"));
+        e.set(ErrorSource::Tip, "tip poll failed again".into());
+        assert_eq!(e.get(ErrorSource::Tip), Some("tip poll failed again"));
+        e.clear(ErrorSource::Tip);
+        assert_eq!(e.latest(), None);
+    }
+
+    #[test]
+    fn synced_clears_only_moot_errors() {
+        let mut e = Errors::default();
+        e.set(ErrorSource::Migration, "migration: no server".into());
+        e.set(ErrorSource::Chunk(0), "chunk".into());
+        e.set(ErrorSource::Tail(0), "tail".into());
+        e.set(ErrorSource::Scan, "chain changed".into());
+        e.clear_moot();
+        assert_eq!(e.latest().as_deref(), Some("migration: no server"));
+    }
 
     #[test]
     fn retries_back_off_to_a_minute() {
