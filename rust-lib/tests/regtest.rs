@@ -163,8 +163,8 @@ fn send_shield_and_migrate_on_regtest() {
     };
 
     let t0 = Instant::now();
+    // A restore opens the wallet.
     c.job("restore_wallet", json!({"network": "regtest", "name": "r1", "password": PW, "phrase": phrase.trim(), "birthdayHeight": 1, "routes": c.routes}));
-    c.job("open_wallet", json!({"network": "regtest", "name": "r1", "password": PW, "routes": c.routes}));
     let s = c.synced();
     println!(
         "synced to {} in {:.1}s: {s}",

@@ -309,10 +309,12 @@ impl Engine {
             return;
         }
         let outcome = match task {
-            Task::Create { network, name, password, routes } => self.create(network, &name, &password, None, None, &routes),
-            Task::Restore { network, name, password, phrase, birthday, routes } => {
-                self.create(network, &name, &password, Some(phrase), Some(birthday), &routes)
+            Task::Create { network, name, password, routes } => {
+                self.create(network, &name, &password, None, None, &routes).and_then(|_| self.open_new(network, &name, &password, &routes))
             }
+            Task::Restore { network, name, password, phrase, birthday, routes } => self
+                .create(network, &name, &password, Some(phrase), Some(birthday), &routes)
+                .and_then(|_| self.open_new(network, &name, &password, &routes)),
             Task::Open { network, name, password, routes } => self.open_wallet(network, &name, &password, &routes),
             Task::Close => Ok(self.close()),
             Task::Propose { input } => self.propose(input),
@@ -367,6 +369,11 @@ impl Engine {
         let phrase = phrase.unwrap_or_else(Phrase::generate);
         let meta = dir.create(network, name, password, &phrase, state, self.work_factor).map_err(|e| e.to_string())?;
         Ok(json!({"name": meta.name, "network": meta.network, "birthdayHeight": meta.birthday_height, "accountUuid": meta.account_uuid}))
+    }
+
+    /// A wallet just created or restored opens at once, with the password just given.
+    fn open_new(&self, network: ZNetwork, name: &str, password: &str, routes: &Routes) -> Result<Value, String> {
+        self.open_wallet(network, name, password, routes).map_err(|e| format!("{name} was created but did not open: {e}"))
     }
 
     fn open_wallet(&self, network: ZNetwork, name: &str, password: &str, routes: &Routes) -> Result<Value, String> {
@@ -995,6 +1002,25 @@ mod tests {
         let mut r = routes(tor, &[LOCAL_NODE_URL], &[]);
         r.broadcast = Some(vec![]);
         assert!(r.config().unwrap().broadcast.is_empty());
+    }
+
+    #[test]
+    fn a_restored_wallet_is_open() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path().to_path_buf(), Arc::new(|_| {}), Some(10), None);
+        // A restore starts from a bundled checkpoint, so nothing is fetched; sync only tries.
+        let params = json!({"network": "mainnet", "name": "r", "password": "pw", "phrase": Phrase::generate().as_str(),
+                            "birthdayHeight": 3_000_000, "routes": {"proxy": "socks5h://127.0.0.1:9", "servers": ["https://zec.rocks:443"]}});
+        let job = engine.start_job("restore_wallet", params.to_string());
+        let (id, receipt) = (job["jobId"].as_str().unwrap(), job["receipt"].as_str().unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while engine.jobs().status(id, receipt)["state"] != "done" {
+            assert!(std::time::Instant::now() < deadline, "{}", engine.jobs().status(id, receipt));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let st = engine.wallet_status();
+        assert_eq!((&st["open"], &st["name"]), (&json!(true), &json!("r")), "{st}");
+        engine.shutdown();
     }
 
     #[test]
