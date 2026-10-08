@@ -36,3 +36,13 @@ jobs:
       - name: Build plugin and package
         # `lgx` is the plugin plus packaging; `default` adds the generated consumer API.
         run: nix build -L .#lgx .#default
+
+  windows:
+    # The cross build on Linux, the PE and import-closure gates and the hand-off live in
+    # logos-co/logos-windows-ci. No smoke: a module plugin has no entry point of its own.
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      targets: default
+      # Measured 284 derivations on a cold cache (2026-10-08): the librustzcash crate graph, SQLCipher and tonic.
+      cold-derivation-budget: 340
