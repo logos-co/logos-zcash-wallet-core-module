@@ -29,10 +29,12 @@ stop_pid() {
 }
 case "${1:-}" in
 start)
+  # Without an address the config below would be empty, and zebrad would start on mainnet.
+  [ -n "${2:-}" ] || { echo "usage: chain.sh start <miner address>" >&2; exit 2; }
   # zebrad backs up its non-finalized blocks every 5 s; a faster restart loses the newest.
   [ -f "$C/zebrad.pid" ] && sleep 6
   stop_pid zebrad
-  cat > "$C/zebrad.toml" <<TOML
+  cat > "$C/zebrad.toml" <<TOML || exit 1
 [mining]
 miner_address = "$2"
 [network]
