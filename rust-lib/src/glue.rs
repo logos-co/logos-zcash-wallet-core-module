@@ -41,6 +41,9 @@ pub trait ZcashWalletCoreModule: Send + Sync + 'static {
     fn addresses(&self, account: String) -> String;
     /// A new diversified shielded address.
     fn new_address(&self, account: String) -> String;
+    /// `{ ok, valid, kind: unified|sapling|transparent|tex, shielded, receivers? }` or
+    /// `{ ok, valid: false, reason }`.
+    fn address_valid(&self, text: String, network: String) -> String;
     /// `{ ok, page, pageSize, rows: [{ txid, kind: received|sent|shielded|migration, height,
     /// pending, expired, expiryHeight, time, delta, fee, pools, memos, to, amountMadePublic }] }`.
     fn history(&self, account: String, page: i64) -> String;
@@ -163,6 +166,10 @@ impl ZcashWalletCoreModule for ZcashWalletCoreModuleImpl {
 
     fn migration_status(&self) -> String {
         self.gated(|e| e.migration_status())
+    }
+
+    fn address_valid(&self, text: String, network: String) -> String {
+        self.gated(|_| Engine::address_valid(&text, &network))
     }
 
     fn history(&self, _account: String, page: i64) -> String {

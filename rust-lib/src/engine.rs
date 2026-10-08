@@ -539,7 +539,7 @@ impl Engine {
             let ua = db
                 .get_last_generated_address_matching(w.account, UnifiedAddressRequest::SHIELDED)
                 .map_err(|e| e.to_string())?;
-            let transparent = first_external_transparent(&db, w.account)?;
+            let transparent = current_transparent(&conn, w.account)?;
             Ok((ua.map(|a| a.encode(&w.network)), transparent))
         });
         match r {
@@ -578,6 +578,26 @@ impl Engine {
             crate::history::page(&conn, w.network, w.account, page)
         });
         r.unwrap_or_else(|e| json!({"ok": false, "error": e}))
+    }
+
+    /// What kind of address `text` is on `network`: unified (with its receivers),
+    /// sapling, transparent or tex; or why it is not one.
+    pub fn address_valid(text: &str, network: &str) -> Value {
+        use zcash_keys::address::Address;
+        let Some(net) = ZNetwork::parse(network) else { return json!({"ok": false, "error": "unknown network"}) };
+        let t = text.trim();
+        match Address::decode(&net, t) {
+            Some(Address::Unified(ua)) => json!({"ok": true, "valid": true, "kind": "unified", "shielded": true,
+                "receivers": {"orchard": ua.has_orchard(), "sapling": ua.has_sapling(), "transparent": ua.has_transparent()}}),
+            Some(Address::Sapling(_)) => json!({"ok": true, "valid": true, "kind": "sapling", "shielded": true}),
+            Some(Address::Transparent(_)) => json!({"ok": true, "valid": true, "kind": "transparent", "shielded": false}),
+            Some(Address::Tex(_)) => json!({"ok": true, "valid": true, "kind": "tex", "shielded": false}),
+            None => {
+                let other = ZNetwork::parse(if net == ZNetwork::Main { "testnet" } else { "mainnet" }).expect("known");
+                let why = if Address::decode(&other, t).is_some() { "this address is for another network" } else { "not a Zcash address" };
+                json!({"ok": true, "valid": false, "reason": why})
+            }
+        }
     }
 
     pub fn reveal_seed(&self, password: &str) -> Value {
@@ -664,19 +684,21 @@ fn transparent_funds<C: std::borrow::Borrow<rusqlite::Connection>>(db: &wallet::
     Ok(json!(rows))
 }
 
-/// The lowest-index external transparent address. Rotation after a payment comes
-/// with the Receive tab work.
-fn first_external_transparent<C: std::borrow::Borrow<rusqlite::Connection>>(db: &wallet::WalletDbOf<C>, account: AccountUuid) -> Result<Option<String>, String> {
-    use zcash_keys::encoding::AddressCodec;
-    let receivers = db.get_transparent_receivers(account, false, false).map_err(|e| e.to_string())?;
-    let mut best: Option<(u32, String)> = None;
-    for (addr, meta) in receivers {
-        let idx = meta.address_index().map(|i| i.index()).unwrap_or(u32::MAX);
-        if best.as_ref().is_none_or(|(b, _)| idx < *b) {
-            best = Some((idx, addr.encode(db.params())));
-        }
-    }
-    Ok(best.map(|(_, a)| a))
+/// The current transparent receive address: the lowest-index external address that has
+/// never been paid. Once it receives, the next one takes its place; the wallet keeps a
+/// gap limit of unused addresses ahead, so the next is always there.
+fn current_transparent(conn: &rusqlite::Connection, account: AccountUuid) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT a.cached_transparent_receiver_address FROM addresses a JOIN accounts acc ON acc.id = a.account_id
+         WHERE acc.uuid = ?1 AND a.key_scope = 0 AND a.transparent_child_index IS NOT NULL
+           AND a.cached_transparent_receiver_address IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM transparent_received_outputs t WHERE t.address_id = a.id)
+         ORDER BY a.transparent_child_index LIMIT 1",
+        [account.expose_uuid()],
+        |r| r.get::<_, String>(0),
+    )
+    .map(Some)
+    .or_else(|e| if matches!(e, rusqlite::Error::QueryReturnedNoRows) { Ok(None) } else { Err(e.to_string()) })
 }
 
 /// Files a proposal under a new id and returns its preview.
@@ -872,5 +894,23 @@ fn wallet_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_kinds() {
+        let t = Engine::address_valid("tmFW7wTNyz1p12KFJizXKM4MRh243MYEj11", "testnet");
+        assert_eq!(t["kind"], "transparent");
+        let u = Engine::address_valid("utest1n5slzdpnu2pphjvqxwcnyjzmsf87de6z48tkpjz9dsmltzw0wpxkc5h4f55ws3xjna2emxenkq38rt3mtyztr65gmas36zh385hrw59a", "testnet");
+        assert_eq!(u["kind"], "unified");
+        assert_eq!(u["receivers"]["transparent"], false);
+        let other = Engine::address_valid("tmFW7wTNyz1p12KFJizXKM4MRh243MYEj11", "mainnet");
+        assert_eq!(other["valid"], false);
+        assert_eq!(other["reason"], "this address is for another network");
+        assert_eq!(Engine::address_valid("hello", "testnet")["reason"], "not a Zcash address");
     }
 }

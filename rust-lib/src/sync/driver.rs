@@ -76,6 +76,9 @@ pub struct Progress {
     pub outputs_scanned: u64,
     pub downloads_in_flight: usize,
     pub details_pending: usize,
+    /// Seconds to finish at the measured pace; none until there is a pace to measure.
+    pub eta_secs: Option<u64>,
+    pub blocks_left: Option<u64>,
     pub chunks_cached: usize,
     pub last_error: Option<String>,
 }
@@ -115,6 +118,8 @@ pub struct Syncer {
     last_end: Option<ChainState>,
     enh_in_flight: HashSet<TransactionDataRequest>,
     last_enh: Option<Instant>,
+    /// When scanning began this session, and how many blocks since, for the ETA.
+    pace: Option<(Instant, u64)>,
     pub progress: Progress,
 }
 
@@ -142,6 +147,7 @@ impl Syncer {
             last_end: None,
             enh_in_flight: HashSet::new(),
             last_enh: None,
+            pace: None,
             progress: Progress { state: "starting".into(), birthday, ..Default::default() },
         }
     }
@@ -176,6 +182,7 @@ impl Syncer {
         self.plan_downloads(db, tip)?;
         let worked = self.scan_once(db, tip)?;
         self.progress.fully_scanned = db.block_fully_scanned().map_err(db_err)?.map(|m| u32::from(m.block_height()));
+        self.update_eta(db, tip)?;
         self.progress.downloads_in_flight = self.in_flight.len() + usize::from(self.head_in_flight);
         if worked {
             self.progress.state = "scanning".into();
@@ -375,6 +382,26 @@ impl Syncer {
             self.rt.spawn(async move {
                 let _ = tx.send(Msg::Chunk(start, fetch::fetch_chunk(&server, &proxy, start, last).await));
             });
+        }
+        Ok(())
+    }
+
+    /// Blocks still to scan, and the time left at this session's pace.
+    fn update_eta(&mut self, db: &Db, tip: u32) -> Result<(), SyncError> {
+        let left: u64 = db
+            .suggest_scan_ranges()
+            .map_err(db_err)?
+            .iter()
+            .filter(|r| !matches!(r.priority(), ScanPriority::Scanned | ScanPriority::Ignored))
+            .map(|r| (u32::from(r.block_range().end).min(tip + 1)).saturating_sub(u32::from(r.block_range().start)) as u64)
+            .sum();
+        self.progress.blocks_left = Some(left);
+        let (start, scanned_then) = *self.pace.get_or_insert((Instant::now(), self.progress.blocks_scanned));
+        let done = self.progress.blocks_scanned.saturating_sub(scanned_then);
+        let secs = start.elapsed().as_secs_f64();
+        self.progress.eta_secs = (done > 0 && secs > 5.0).then(|| (left as f64 * secs / done as f64).round() as u64);
+        if left == 0 {
+            self.progress.eta_secs = Some(0);
         }
         Ok(())
     }
