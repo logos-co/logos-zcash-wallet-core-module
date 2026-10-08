@@ -3,7 +3,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -44,6 +45,16 @@ pub fn local_node() -> Option<Arc<dyn GrpcCall>> {
     LOCAL_NODE.read().unwrap().clone()
 }
 
+static CLOSED: AtomicBool = AtomicBool::new(false);
+static CLOSING: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
+
+/// For unload: calls in flight answer UNAVAILABLE at once and no new ones start. A call
+/// runs on the module's main thread, which unload holds while it joins the wallet threads.
+pub fn close() {
+    CLOSED.store(true, Ordering::SeqCst);
+    CLOSING.notify_waiters();
+}
+
 /// A tower service a tonic client can run over, in place of a network channel.
 #[derive(Clone)]
 pub struct IpcChannel {
@@ -78,8 +89,20 @@ impl IpcChannel {
     ) -> Result<http::Response<tonic::body::Body>, BoxError> {
         let path = req.uri().path().to_string();
         let body = req.into_body().collect().await?.to_bytes();
-        // The IPC call blocks; keep it off the async workers.
-        let (status, message, out) = tokio::task::spawn_blocking(move || call.call(&path, &body)).await?;
+        let closing = CLOSING.notified();
+        tokio::pin!(closing);
+        closing.as_mut().enable();
+        let unloading = || (14, "the wallet is unloading".to_string(), Vec::new());
+        let (status, message, out) = if CLOSED.load(Ordering::SeqCst) {
+            unloading()
+        } else {
+            // The IPC call blocks; keep it off the async workers.
+            let call = tokio::task::spawn_blocking(move || call.call(&path, &body));
+            tokio::select! {
+                r = call => r?,
+                _ = closing => unloading(),
+            }
+        };
         let mut trailers = http::HeaderMap::new();
         trailers.insert("grpc-status", status.to_string().parse()?);
         let message: String = message.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').filter(|c| *c != '%').collect();
@@ -126,6 +149,16 @@ mod tests {
         }
     }
 
+    /// Answers only when released.
+    struct Stuck(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+
+    impl GrpcCall for Stuck {
+        fn call(&self, _: &str, _: &[u8]) -> (i32, String, Vec<u8>) {
+            let _ = self.0.lock().unwrap().recv();
+            (0, String::new(), vec![])
+        }
+    }
+
     #[tokio::test]
     async fn a_tonic_client_runs_over_ipc() {
         let mut c = CompactTxStreamerClient::new(IpcChannel::new(Arc::new(Fake)));
@@ -133,5 +166,15 @@ mod tests {
         assert_eq!(tip.height, 4242);
         let e = c.get_lightd_info(zcash_client_backend::proto::service::Empty {}).await.unwrap_err();
         assert_eq!((e.code(), e.message()), (tonic::Code::Unavailable, "node is not running"));
+
+        // Last, since closing is for good: a call waiting on the node answers at once.
+        let (release, rx) = std::sync::mpsc::channel();
+        let mut c = CompactTxStreamerClient::new(IpcChannel::new(Arc::new(Stuck(std::sync::Mutex::new(rx)))));
+        let pending = tokio::spawn(async move { c.get_latest_block(ChainSpec {}).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        close();
+        let e = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await.unwrap().unwrap().unwrap_err();
+        assert_eq!((e.code(), e.message()), (tonic::Code::Unavailable, "the wallet is unloading"));
+        release.send(()).unwrap();
     }
 }
