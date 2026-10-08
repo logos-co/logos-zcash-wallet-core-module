@@ -4,11 +4,22 @@ use std::time::Duration;
 
 use http::Uri;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tower::ServiceExt;
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 
+use super::ipc::{local_node, IpcChannel, TransportError, LOCAL_NODE_URL};
 use super::socks::{Isolation, ProxyAddr, Socks5hConnector};
 
-pub type Client = CompactTxStreamerClient<Channel>;
+/// A network channel or the local node's IPC, behind one type.
+pub type GrpcChannel =
+    tower::util::BoxCloneSyncService<http::Request<tonic::body::Body>, http::Response<tonic::body::Body>, TransportError>;
+
+pub type Client = CompactTxStreamerClient<GrpcChannel>;
+
+fn client(channel: Channel) -> Client {
+    let channel = channel.map_err(|e| TransportError(Box::new(e)));
+    CompactTxStreamerClient::new(GrpcChannel::new(channel)).max_decoding_message_size(16 * 1024 * 1024)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
@@ -18,13 +29,20 @@ pub enum NetError {
     Connect { server: String, source: tonic::transport::Error },
     #[error("{server}: {status}")]
     Status { server: String, status: tonic::Status },
+    #[error("the local node is not available")]
+    NoLocalNode,
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Opens a TLS channel to `server` (https://host:port) through the proxy, on the
-/// circuit `isolation` selects. Only https URLs are accepted.
+/// circuit `isolation` selects; or, for `logos://zebrad_module`, the local node over IPC.
 pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> Result<Client, NetError> {
+    if server == LOCAL_NODE_URL {
+        let call = local_node().ok_or(NetError::NoLocalNode)?;
+        let channel = GrpcChannel::new(IpcChannel::new(call));
+        return Ok(CompactTxStreamerClient::new(channel).max_decoding_message_size(16 * 1024 * 1024));
+    }
     let uri: Uri = server.parse().map_err(|_| NetError::BadUrl(server.into()))?;
     if proxy.is_direct() {
         // Regtest only: plaintext to a loopback lightwalletd, never anywhere else.
@@ -37,7 +55,7 @@ pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> R
             .connect()
             .await
             .map_err(|source| NetError::Connect { server: server.into(), source })?;
-        return Ok(CompactTxStreamerClient::new(channel).max_decoding_message_size(16 * 1024 * 1024));
+        return Ok(client(channel));
     }
     if uri.scheme_str() != Some("https") {
         return Err(NetError::BadUrl(server.into()));
@@ -53,7 +71,7 @@ pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> R
         .connect_with_connector(Socks5hConnector::new(proxy.clone(), isolation))
         .await
         .map_err(wrap)?;
-    Ok(CompactTxStreamerClient::new(channel).max_decoding_message_size(16 * 1024 * 1024))
+    Ok(client(channel))
 }
 
 #[cfg(test)]

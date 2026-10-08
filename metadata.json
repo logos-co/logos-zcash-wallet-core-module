@@ -10,6 +10,7 @@
   "author": "Logos Core Team",
   "main": "zcash_wallet_core_module_plugin",
   "dependencies": [],
+  "optional_dependencies": ["zebrad_module"],
   "include": [
     "sapling-spend.params",
     "sapling-output.params"

@@ -12,7 +12,7 @@ use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::TxId;
 
-use crate::net::client::{connect, NetError};
+use crate::net::client::{connect, Client, NetError};
 use crate::net::socks::{Isolation, ProxyAddr};
 use crate::network::ZNetwork;
 
@@ -78,19 +78,48 @@ pub async fn fetch(
             Ok(Fetched::Txs(vec![parse(params, &raw, tip).map_err(bad)?]))
         }
         TransactionDataRequest::TransactionsInvolvingAddress(r) => {
-            let range = BlockRange {
-                start: Some(BlockId { height: u32::from(r.block_range_start()) as u64, hash: vec![] }),
-                // The protocol needs both ends; an open range ends at the tip.
-                end: Some(BlockId { height: r.block_range_end().map_or(tip, |e| u32::from(e) - 1) as u64, hash: vec![] }),
-                pool_types: vec![],
-            };
-            let arg = TransparentAddressBlockFilter { address: r.address().encode(&params), range: Some(range) };
-            let raws: Vec<RawTransaction> =
-                c.get_taddress_transactions(arg).await.map_err(status)?.into_inner().try_collect().await.map_err(status)?;
-            let txs = raws.iter().map(|raw| parse(params, raw, tip)).collect::<Result<Vec<_>, _>>().map_err(bad)?;
+            // The protocol needs both ends; an open range ends at the tip.
+            let end = r.block_range_end().map_or(tip, |e| u32::from(e) - 1);
+            let txs = address_txs(&mut c, params, server, r.address().encode(&params), u32::from(r.block_range_start()), end, tip).await?;
             Ok(Fetched::Txs(txs))
         }
     }
+}
+
+/// Transactions involving a transparent address, mined from `start` to `end`.
+pub async fn received(
+    params: ZNetwork,
+    server: &str,
+    proxy: &ProxyAddr,
+    address: String,
+    start: u32,
+    end: u32,
+    tip: u32,
+) -> Result<Vec<(Transaction, Option<BlockHeight>)>, NetError> {
+    let mut c = connect(server, proxy, Isolation::fresh()).await?;
+    address_txs(&mut c, params, server, address, start, end, tip).await
+}
+
+async fn address_txs(
+    c: &mut Client,
+    params: ZNetwork,
+    server: &str,
+    address: String,
+    start: u32,
+    end: u32,
+    tip: u32,
+) -> Result<Vec<(Transaction, Option<BlockHeight>)>, NetError> {
+    let status = |status| NetError::Status { server: server.into(), status };
+    let bad = |detail: String| NetError::Status { server: server.into(), status: tonic::Status::data_loss(detail) };
+    let range = BlockRange {
+        start: Some(BlockId { height: start as u64, hash: vec![] }),
+        end: Some(BlockId { height: end as u64, hash: vec![] }),
+        pool_types: vec![],
+    };
+    let arg = TransparentAddressBlockFilter { address, range: Some(range) };
+    let raws: Vec<RawTransaction> =
+        c.get_taddress_transactions(arg).await.map_err(status)?.into_inner().try_collect().await.map_err(status)?;
+    raws.iter().map(|raw| parse(params, raw, tip)).collect::<Result<Vec<_>, _>>().map_err(bad)
 }
 
 /// Address queries wait for the time the wallet suggested; others go out now.
