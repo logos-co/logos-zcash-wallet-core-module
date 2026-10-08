@@ -87,6 +87,11 @@ impl ZNetwork {
         }
     }
 
+    /// Whether a server's reported chain name fits. Zebra names regtest "test", zcashd "regtest".
+    pub fn accepts_lightd_chain(self, name: &str) -> bool {
+        name == self.lightd_chain_name() || (self == ZNetwork::Regtest && name == "test")
+    }
+
     /// The consensus branch ID at `height`, as lightwalletd prints it.
     pub fn branch_id_hex(self, height: BlockHeight) -> String {
         format!("{:08x}", u32::from(consensus::BranchId::for_height(&self, height)))

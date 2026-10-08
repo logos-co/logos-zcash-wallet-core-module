@@ -17,7 +17,7 @@ use zcash_client_backend::proto::service::{GetSubtreeRootsArg, LightdInfo, Shiel
 use zcash_primitives::merkle_tree::HashSer;
 use zcash_protocol::consensus::BlockHeight;
 
-use super::cache::{grid_floor, BlockCache, GRID};
+use super::cache::{chunk_first, grid_floor, BlockCache, GRID};
 use super::enhance::{self, Fetched};
 use super::fetch::{self, Chunk};
 use super::frontier::{self, FrontierError};
@@ -256,8 +256,8 @@ impl Syncer {
     }
 
     fn check_server(&self, server: &str, info: &LightdInfo, tip: u32) -> Result<(), SyncError> {
-        let want = self.params.lightd_chain_name();
-        if info.chain_name != want {
+        if !self.params.accepts_lightd_chain(&info.chain_name) {
+            let want = self.params.lightd_chain_name();
             return Err(SyncError::WrongChain { server: server.into(), got: info.chain_name.clone(), want: want.into() });
         }
         let want_branch = self.params.branch_id_hex(BlockHeight::from(tip + 1));
@@ -273,7 +273,7 @@ impl Syncer {
     fn store_chunk(&mut self, chunk: Chunk) -> Result<(), SyncError> {
         let misbehaving = |detail: String| SyncError::Misbehaving { server: chunk.server.clone(), detail };
         let below = chunk.below.to_chain_state().map_err(|e| misbehaving(e.to_string()))?;
-        if chunk.blocks.len() as u32 != chunk.last - chunk.start + 1 {
+        if chunk.blocks.len() as u32 != chunk.last + 1 - chunk_first(chunk.start) {
             return Err(misbehaving(format!("returned {} blocks for {}..={}", chunk.blocks.len(), chunk.start, chunk.last)));
         }
         let end = frontier::advance(&below, &chunk.blocks).map_err(|e| misbehaving(e.to_string()))?;
@@ -352,7 +352,7 @@ impl Syncer {
         let tip_chunk = grid_floor(tip);
         // The tip chunk grows block by block; fetch what is new since last time.
         if !self.head_in_flight && self.cache.chunk_end(tip_chunk)?.is_some() {
-            let have = self.cache.contiguous_end(tip_chunk)?;
+            let have = self.cache.contiguous_end(chunk_first(tip_chunk))?;
             if have <= tip {
                 self.head_in_flight = true;
                 let (server, proxy, tx) = (self.server_for(), self.cfg.proxy.clone(), self.tx.clone());
@@ -457,7 +457,7 @@ impl Syncer {
                 return Ok(Some(s.clone()));
             }
         }
-        let g = grid_floor(start);
+        let g = chunk_first(grid_floor(start));
         let Some(ts) = self.cache.tree_state(g - 1)? else { return Ok(None) };
         let base = ts.to_chain_state().map_err(|e| SyncError::Misbehaving { server: "cache".into(), detail: e.to_string() })?;
         let mut blocks = Vec::with_capacity((start - g) as usize);

@@ -23,19 +23,24 @@ pub struct Chunk {
 }
 
 pub async fn fetch_chunk(server: &str, proxy: &ProxyAddr, start: u32, last: u32) -> Result<Chunk, NetError> {
+    let first = super::cache::chunk_first(start);
     let mut c = connect(server, proxy, Isolation::fresh()).await?;
-    let below = c
-        .get_tree_state(BlockId { height: (start - 1) as u64, hash: vec![] })
-        .await
-        .map_err(status(server))?
-        .into_inner();
     let range = BlockRange {
-        start: Some(BlockId { height: start as u64, hash: vec![] }),
+        start: Some(BlockId { height: first as u64, hash: vec![] }),
         end: Some(BlockId { height: last as u64, hash: vec![] }),
         pool_types: ALL_POOLS.iter().map(|p| *p as i32).collect(),
     };
     let blocks: Vec<CompactBlock> =
         c.get_block_range(range).await.map_err(status(server))?.into_inner().try_collect().await.map_err(status(server))?;
+    // Genesis holds no notes and lightwalletd cannot serve its tree state, so below block 1
+    // is the empty tree under the hash block 1 points to. The blocks are checked against it.
+    let below = if first == 1 {
+        let mut hash = blocks.first().map(|b| b.prev_hash.clone()).unwrap_or_default();
+        hash.reverse();
+        TreeState { height: 0, hash: hex::encode(hash), ..Default::default() }
+    } else {
+        c.get_tree_state(BlockId { height: (first - 1) as u64, hash: vec![] }).await.map_err(status(server))?.into_inner()
+    };
     Ok(Chunk { start, last, server: server.into(), below, blocks })
 }
 
