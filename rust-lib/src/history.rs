@@ -3,6 +3,7 @@
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use zcash_client_sqlite::AccountUuid;
+use zcash_protocol::zip318::Zip318Classification;
 
 use crate::network::ZNetwork;
 
@@ -53,7 +54,7 @@ pub fn page(conn: &Connection, network: ZNetwork, account: AccountUuid, page: u3
                 r.get::<_, Option<bool>>(8)?,
                 r.get::<_, Option<bool>>(9)?,
                 r.get::<_, Option<i64>>(10)?,
-                r.get::<_, Option<String>>(11)?,
+                r.get::<_, Option<i64>>(11)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -86,7 +87,9 @@ pub fn page(conn: &Connection, network: ZNetwork, account: AccountUuid, page: u3
                 to.push(json!({"address": addr, "pool": pool(p), "amount": value}));
             }
         }
-        let kind = if zip318.is_some() {
+        // zip318_kind is an integer code; 0 means not classified yet, never "not a migration".
+        let migration = matches!(zip318.map(Zip318Classification::from_code), Some(Zip318Classification::Conforms(_)));
+        let kind = if migration {
             "migration"
         } else if shielding.unwrap_or(false) {
             "shielded"
