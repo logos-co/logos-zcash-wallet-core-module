@@ -9,11 +9,14 @@
     let
       nixpkgs = logos-module-builder.inputs.nixpkgs;
       systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems f;
+      # x86_64-windows is a cross build from x86_64-linux.
+      targets = systems ++ [ "x86_64-windows" ];
+      forAllSystems = f: nixpkgs.lib.genAttrs targets f;
       # Sapling proving parameters ship beside the plugin, fetched at build time with
       # pinned hashes, so a send never downloads them outside the proxy.
       saplingParams = system:
-        let pkgs = nixpkgs.legacyPackages.${system}; in
+        # The parameter files are data; fetch them with the builder's own package set.
+        let pkgs = nixpkgs.legacyPackages.${if system == "x86_64-windows" then "x86_64-linux" else system}; in
         pkgs.runCommand "zcash-sapling-params" {
           spend = pkgs.fetchurl {
             url = "https://download.z.cash/downloads/sapling-spend.params";
