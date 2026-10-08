@@ -73,3 +73,30 @@ pub async fn send_transaction(server: &str, proxy: &ProxyAddr, raw: Vec<u8>) -> 
         .into_inner();
     Ok((r.error_code, r.error_message))
 }
+
+/// Whether `server` knows the transaction, mined or in its mempool, asked on a fresh circuit.
+pub async fn knows_transaction(server: &str, proxy: &ProxyAddr, txid: &[u8]) -> Result<bool, NetError> {
+    let mut c = connect(server, proxy, Isolation::fresh()).await?;
+    let filter = zcash_client_backend::proto::service::TxFilter { block: None, index: 0, hash: txid.to_vec() };
+    match c.get_transaction(filter).await {
+        Ok(_) => Ok(true),
+        Err(s) if s.code() == tonic::Code::NotFound => Ok(false),
+        Err(s) => Err(NetError::Status { server: server.into(), status: s }),
+    }
+}
+
+/// After one operator accepted a transaction, the other must know it within two minutes,
+/// or it is sent there too. Returns what happened, for the log.
+pub async fn confirm_elsewhere(other: &str, proxy: &ProxyAddr, txid: Vec<u8>, raw: Vec<u8>) -> String {
+    for _ in 0..6 {
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        if let Ok(true) = knows_transaction(other, proxy, &txid).await {
+            return format!("{other} saw the transaction");
+        }
+    }
+    match send_transaction(other, proxy, raw).await {
+        Ok((0, _)) => format!("{other} had not seen it; sent there too"),
+        Ok((code, msg)) => format!("{other} refused it: {code} {msg}"),
+        Err(e) => format!("{other} unreachable: {e}"),
+    }
+}

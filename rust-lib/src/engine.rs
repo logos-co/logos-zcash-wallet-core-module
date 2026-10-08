@@ -447,6 +447,14 @@ impl Engine {
                 match self.rt.block_on(fetch::send_transaction(server, &cfg.proxy, raw.clone())) {
                     Ok((0, _)) => {
                         outcome = json!({"txid": txid, "accepted": true, "server": server});
+                        // Servers in the route table are one per operator: the next one checks.
+                        if let Some(other) = cfg.servers.iter().find(|s| *s != server).cloned() {
+                            let (proxy, raw, id) = (cfg.proxy.clone(), raw.clone(), txid_bytes(&txid));
+                            self.rt.spawn(async move {
+                                let note = fetch::confirm_elsewhere(&other, &proxy, id, raw).await;
+                                tracing::info!(target: "zcash", "{note}");
+                            });
+                        }
                         break;
                     }
                     Ok((code, msg)) => outcome = json!({"txid": txid, "accepted": false, "server": server, "error": format!("{code}: {msg}")}),
@@ -574,6 +582,13 @@ impl Engine {
         });
         r.unwrap_or_else(|e| json!({"ok": false, "error": e}))
     }
+}
+
+/// A txid's internal byte order from its display form.
+fn txid_bytes(display: &str) -> Vec<u8> {
+    let mut b = hex::decode(display).unwrap_or_default();
+    b.reverse();
+    b
 }
 
 fn zat(v: zcash_protocol::value::Zatoshis) -> u64 {
