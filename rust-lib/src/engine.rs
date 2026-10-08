@@ -850,19 +850,21 @@ fn wallet_loop(
                 }
             }
         }
-        match syncer.step(&mut db) {
-            Ok(Step::Worked) => backoff = Duration::from_millis(500),
-            Ok(Step::Waiting | Step::Synced) => {
-                let _ = syncer.wait(&mut db, Duration::from_millis(500));
+        let stepped = match syncer.step(&mut db) {
+            Ok(Step::Worked) => {
+                backoff = Duration::from_millis(500);
+                Ok(())
             }
-            Err(e) => {
-                syncer.progress.last_error = Some(e.to_string());
-                let until = Instant::now() + backoff;
-                while Instant::now() < until && !stop.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                backoff = (backoff * 2).min(Duration::from_secs(60));
+            Ok(Step::Waiting | Step::Synced) => syncer.wait(&mut db, Duration::from_millis(500)),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = stepped {
+            syncer.progress.last_error = Some(e.to_string());
+            let until = Instant::now() + backoff;
+            while Instant::now() < until && !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
             }
+            backoff = (backoff * 2).min(Duration::from_secs(60));
         }
         *progress.lock().unwrap() = syncer.progress.clone();
         if last_emit.elapsed() >= Duration::from_secs(1) {

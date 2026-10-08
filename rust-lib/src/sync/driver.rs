@@ -284,9 +284,9 @@ impl Syncer {
             let want = self.params.lightd_chain_name();
             return Err(SyncError::WrongChain { server: server.into(), got: info.chain_name.clone(), want: want.into() });
         }
-        let want_branch = self.params.branch_id_hex(BlockHeight::from(tip + 1));
-        if !info.consensus_branch_id.eq_ignore_ascii_case(&want_branch) {
-            return Err(SyncError::UnknownBranch { server: server.into(), got: info.consensus_branch_id.clone(), want: want_branch });
+        if !self.params.accepts_branch(&info.consensus_branch_id, tip) {
+            let want = self.params.branch_id_hex(BlockHeight::from(tip + 1));
+            return Err(SyncError::UnknownBranch { server: server.into(), got: info.consensus_branch_id.clone(), want });
         }
         Ok(())
     }
