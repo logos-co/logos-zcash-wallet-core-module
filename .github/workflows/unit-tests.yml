@@ -1,0 +1,31 @@
+name: Unit tests
+
+# Plain cargo: --no-default-features drops the module glue and the SDK path dependency.
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (no module glue)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-lib
+
+      - name: cargo test --no-default-features
+        run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
