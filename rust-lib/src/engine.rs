@@ -62,6 +62,7 @@ enum Task {
     Open { network: ZNetwork, name: String, password: Zeroizing<String>, routes: Routes },
     Close,
     Propose { input: crate::send::SendInput },
+    ProposeShielding { address: String },
     SignAndSend { proposal: String, password: Zeroizing<String> },
     ChangePassword { network: ZNetwork, name: String, old: Zeroizing<String>, new: Zeroizing<String> },
 }
@@ -79,6 +80,7 @@ struct Params {
     routes: Option<Routes>,
     send: Option<crate::send::SendInput>,
     proposal_id: Option<String>,
+    address: Option<String>,
 }
 
 impl Drop for Params {
@@ -127,6 +129,7 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
         },
         "close_wallet" => Task::Close,
         "propose" => Task::Propose { input: p.send.clone().ok_or("send is required")? },
+        "propose_shielding" => Task::ProposeShielding { address: p.address.clone().ok_or("address is required")? },
         "sign_and_send" => Task::SignAndSend {
             proposal: p.proposal_id.clone().ok_or("proposalId is required")?,
             password: take(&mut p.password, "password")?,
@@ -144,6 +147,7 @@ fn parse_task(kind: &str, raw: &str) -> Result<Task, String> {
 enum WalletCmd {
     NewAddress(Sender<Result<Value, String>>),
     Propose(crate::send::SendInput, Sender<Result<Value, String>>),
+    ProposeShielding(String, Sender<Result<Value, String>>),
     Sign(String, Phrase, Arc<zcash_proofs::prover::LocalTxProver>, Sender<Result<Vec<(String, Vec<u8>)>, String>>),
 }
 
@@ -264,6 +268,7 @@ impl Engine {
             Task::Open { network, name, password, routes } => self.open_wallet(network, &name, &password, &routes),
             Task::Close => Ok(self.close()),
             Task::Propose { input } => self.propose(input),
+            Task::ProposeShielding { address } => self.ask(|tx| WalletCmd::ProposeShielding(address, tx), Duration::from_secs(60)),
             Task::SignAndSend { proposal, password } => self.sign_and_send(&proposal, &password),
             Task::ChangePassword { network, name, old, new } => WalletDir::new(&self.root, network, &name)
                 .change_password(&old, &new, self.work_factor)
@@ -291,19 +296,22 @@ impl Engine {
         if dir.exists() {
             return Err(format!("a wallet named {name} already exists"));
         }
-        let server = cfg.servers[0].clone();
-        let (tip, _) = self
-            .rt
-            .block_on(fetch::tip_and_info(&server, &cfg.proxy, crate::net::socks::Isolation::fresh()))
-            .map_err(|e| e.to_string())?;
-        // A new wallet starts at the grid height at least HEAD blocks below the tip, so
-        // the tree state it asks for is one every new wallet of the same hour asks for.
-        let start = match birthday {
-            Some(h) => grid_floor(h.min(tip)),
-            None => grid_floor(tip.saturating_sub(HEAD)),
+        // A restore starts from a bundled checkpoint, so no server learns the birthday.
+        // A new wallet starts at the grid height at least HEAD blocks below the tip:
+        // every new wallet of that hour asks for the same tree state.
+        let state = match birthday {
+            Some(h) => crate::checkpoints::restore_point(network, h)?,
+            None => {
+                let server = cfg.servers[0].clone();
+                let (tip, _) = self
+                    .rt
+                    .block_on(fetch::tip_and_info(&server, &cfg.proxy, crate::net::socks::Isolation::fresh()))
+                    .map_err(|e| e.to_string())?;
+                let start = grid_floor(tip.saturating_sub(HEAD));
+                let below = self.rt.block_on(fetch::tree_state(&server, &cfg.proxy, start - 1)).map_err(|e| e.to_string())?;
+                below.to_chain_state().map_err(|e| e.to_string())?
+            }
         };
-        let below = self.rt.block_on(fetch::tree_state(&server, &cfg.proxy, start - 1)).map_err(|e| e.to_string())?;
-        let state = below.to_chain_state().map_err(|e| e.to_string())?;
         let phrase = phrase.unwrap_or_else(Phrase::generate);
         let meta = dir.create(network, name, password, &phrase, state, self.work_factor).map_err(|e| e.to_string())?;
         Ok(json!({"name": meta.name, "network": meta.network, "birthdayHeight": meta.birthday_height, "accountUuid": meta.account_uuid}))
@@ -554,8 +562,25 @@ fn balances_json(db: &Db, account: AccountUuid) -> Result<Value, String> {
             "transparent": pool_json(&b.unshielded_balance()),
         },
         "shielded": {"spendable": shielded_spendable, "total": shielded_total},
+        "transparentAddresses": transparent_funds(db, account, summary.chain_tip_height())?,
+        "shieldingThreshold": crate::send::SHIELDING_THRESHOLD,
         "total": zat(b.total()),
     }))
+}
+
+/// Transparent funds per address, for a Shield action each (ZIP 315: never linked).
+fn transparent_funds(db: &Db, account: AccountUuid, tip: zcash_protocol::consensus::BlockHeight) -> Result<Value, String> {
+    use zcash_keys::encoding::AddressCodec;
+    let balances = db
+        .get_transparent_balances(account, (tip + 1).into(), ConfirmationsPolicy::default())
+        .map_err(|e| e.to_string())?;
+    let mut rows: Vec<Value> = balances
+        .into_iter()
+        .filter(|(_, (_, b))| b.total().into_u64() > 0)
+        .map(|(addr, (_, b))| json!({"address": addr.encode(db.params()), "spendable": zat(b.spendable_value()), "total": zat(b.total())}))
+        .collect();
+    rows.sort_by(|a, b| a["address"].as_str().cmp(&b["address"].as_str()));
+    Ok(json!(rows))
 }
 
 /// The lowest-index external transparent address. Rotation after a payment comes
@@ -571,6 +596,21 @@ fn first_external_transparent(db: &Db, account: AccountUuid) -> Result<Option<St
         }
     }
     Ok(best.map(|(_, a)| a))
+}
+
+/// Files a proposal under a new id and returns its preview.
+fn keep(
+    prepared: &mut std::collections::HashMap<String, crate::send::Prepared>,
+    next: &mut u64,
+    params: &ZNetwork,
+    proposal: crate::send::AnyProposal,
+) -> Result<Value, String> {
+    let expiry = crate::send::expiry_for(params, proposal.min_target_height())?;
+    let preview = proposal.preview(params, expiry);
+    *next += 1;
+    let id = format!("p{next}");
+    prepared.insert(id.clone(), crate::send::Prepared { created: Instant::now(), proposal, expiry, preview: preview.clone() });
+    Ok(json!({"proposalId": id, "preview": preview}))
 }
 
 fn wallet_loop(
@@ -602,14 +642,14 @@ fn wallet_loop(
                     let _ = reply.send(r);
                 }
                 WalletCmd::Propose(input, reply) => {
-                    let r = crate::send::propose(&mut db, params, account, &input).and_then(|proposal| {
-                        let expiry = crate::send::expiry_for(&params, proposal.min_target_height().into())?;
-                        let preview = crate::send::preview(&params, &proposal, expiry);
-                        next_proposal += 1;
-                        let id = format!("p{next_proposal}");
-                        prepared.insert(id.clone(), crate::send::Prepared { created: Instant::now(), proposal, expiry, preview: preview.clone() });
-                        Ok(json!({"proposalId": id, "preview": preview}))
-                    });
+                    let r = crate::send::propose(&mut db, params, account, &input)
+                        .map(crate::send::AnyProposal::Send)
+                        .and_then(|p| keep(&mut prepared, &mut next_proposal, &params, p));
+                    let _ = reply.send(r);
+                }
+                WalletCmd::ProposeShielding(address, reply) => {
+                    let r = crate::send::propose_shield(&mut db, params, account, &address)
+                        .and_then(|p| keep(&mut prepared, &mut next_proposal, &params, p));
                     let _ = reply.send(r);
                 }
                 WalletCmd::Sign(id, phrase, prover, reply) => {

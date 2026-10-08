@@ -1,5 +1,6 @@
 //! Zcash wallet engine for Logos.
 
+pub mod checkpoints;
 pub mod engine;
 pub mod gate;
 pub mod jobs;

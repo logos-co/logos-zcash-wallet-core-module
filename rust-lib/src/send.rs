@@ -65,11 +65,65 @@ pub struct SendInput {
     pub allow_mixed_pools: bool,
 }
 
+pub enum AnyProposal {
+    Send(WalletProposal),
+    Shield(Proposal<StandardFeeRule, std::convert::Infallible>),
+}
+
+impl AnyProposal {
+    pub fn min_target_height(&self) -> BlockHeight {
+        match self {
+            AnyProposal::Send(p) => p.min_target_height().into(),
+            AnyProposal::Shield(p) => p.min_target_height().into(),
+        }
+    }
+
+    pub fn preview(&self, params: &ZNetwork, expiry: BlockHeight) -> Value {
+        match self {
+            AnyProposal::Send(p) => preview(params, p, expiry),
+            AnyProposal::Shield(p) => {
+                let mut v = preview(params, p, expiry);
+                v["shielding"] = json!(true);
+                v
+            }
+        }
+    }
+}
+
 pub struct Prepared {
     pub created: Instant,
-    pub proposal: WalletProposal,
+    pub proposal: AnyProposal,
     pub expiry: BlockHeight,
     pub preview: Value,
+}
+
+/// Transparent funds are offered for shielding above this amount (0.001 ZEC).
+pub const SHIELDING_THRESHOLD: u64 = 100_000;
+
+/// Proposes shielding everything at one transparent address, never several in one
+/// transaction, which would link them (ZIP 315).
+pub fn propose_shield(db: &mut Db, params: ZNetwork, account: AccountUuid, address: &str) -> Result<AnyProposal, String> {
+    let taddr = match zcash_keys::address::Address::decode(&params, address.trim()) {
+        Some(zcash_keys::address::Address::Transparent(t)) => t,
+        _ => return Err("not a transparent address of this network".into()),
+    };
+    let selector = GreedyInputSelector::new();
+    let change = SingleOutputChangeStrategy::new(StandardFeeRule::Zip317, None, ShieldedPool::Ironwood, DustOutputPolicy::default());
+    let threshold = Zatoshis::from_u64(SHIELDING_THRESHOLD).expect("constant");
+    zcash_client_backend::data_api::wallet::propose_shielding::<_, _, _, _, std::convert::Infallible>(
+        db,
+        &params,
+        &selector,
+        &change,
+        threshold,
+        &[taddr],
+        account,
+        ConfirmationsPolicy::default(),
+        zcash_client_backend::data_api::CoinbaseFilter::AllTransparentOutputs,
+        None,
+    )
+    .map(AnyProposal::Shield)
+    .map_err(|e| e.to_string())
 }
 
 fn pool_name(p: PoolType) -> &'static str {
@@ -152,7 +206,7 @@ pub fn propose(db: &mut Db, params: ZNetwork, account: AccountUuid, input: &Send
 }
 
 /// What the approver reviews: recipients, fee, pools, and the amount made public.
-pub fn preview(params: &ZNetwork, p: &WalletProposal, expiry: BlockHeight) -> Value {
+pub fn preview<N>(params: &ZNetwork, p: &Proposal<StandardFeeRule, N>, expiry: BlockHeight) -> Value {
     let mut recipients = vec![];
     let mut fee = 0u64;
     let mut ins: BTreeMap<&str, u64> = BTreeMap::new();
@@ -234,19 +288,17 @@ pub fn sign(
     };
     let usk = UnifiedSpendingKey::from_seed(&params, phrase.seed().expose_secret(), index).map_err(|e| format!("{e:?}"))?;
     let mut rng = crate::wallet::new_rng();
-    let txids = create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
-        db,
-        &params,
-        &SystemClock,
-        &mut rng,
-        prover,
-        prover,
-        &SpendingKeys::new(usk),
-        OvkPolicy::Sender,
-        &prepared.proposal,
-        Some(prepared.expiry),
-    )
-    .map_err(|e| e.to_string())?;
+    let keys = SpendingKeys::new(usk);
+    let txids = match &prepared.proposal {
+        AnyProposal::Send(p) => create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
+            db, &params, &SystemClock, &mut rng, prover, prover, &keys, OvkPolicy::Sender, p, Some(prepared.expiry),
+        )
+        .map_err(|e| e.to_string())?,
+        AnyProposal::Shield(p) => create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
+            db, &params, &SystemClock, &mut rng, prover, prover, &keys, OvkPolicy::Sender, p, Some(prepared.expiry),
+        )
+        .map_err(|e| e.to_string())?,
+    };
     let mut out = vec![];
     for txid in txids {
         let tx = db.get_transaction(txid).map_err(|e| e.to_string())?.ok_or("built transaction missing")?;
