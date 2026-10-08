@@ -1,7 +1,7 @@
 //! The sync driver. It runs on the wallet thread, one bounded step at a time, so
 //! commands and cancellation are handled between steps.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -108,6 +108,9 @@ pub struct Syncer {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     in_flight: BTreeSet<u32>,
+    /// Failed downloads wait before the next try: failures so far and the time to retry.
+    retry: HashMap<u32, (u32, Instant)>,
+    head_retry: (u32, Option<Instant>),
     head_in_flight: bool,
     tip_in_flight: bool,
     last_tip_poll: Option<Instant>,
@@ -127,6 +130,13 @@ fn db_err<E: std::fmt::Display>(e: E) -> SyncError {
     SyncError::Db(e.to_string())
 }
 
+/// 1, 2, 4 ... 60 s after consecutive failures, plus up to a quarter more at random, so
+/// a failing server is not hammered with fresh connections (and Tor circuits).
+fn retry_delay(failures: u32) -> Duration {
+    let base = Duration::from_secs(1u64 << failures.saturating_sub(1).min(6)).min(Duration::from_secs(60));
+    base + Duration::from_millis(rand::RngExt::random_range(&mut rand::rng(), 0..=base.as_millis() as u64 / 4))
+}
+
 impl Syncer {
     pub fn new(params: ZNetwork, cfg: SyncConfig, rt: tokio::runtime::Handle, cache: Arc<BlockCache>, birthday: u32) -> Self {
         let (tx, rx) = channel();
@@ -138,6 +148,8 @@ impl Syncer {
             tx,
             rx,
             in_flight: BTreeSet::new(),
+            retry: HashMap::new(),
+            head_retry: (0, None),
             head_in_flight: false,
             tip_in_flight: false,
             last_tip_poll: None,
@@ -229,8 +241,16 @@ impl Syncer {
             Msg::Chunk(start, r) => {
                 self.in_flight.remove(&start);
                 match r {
-                    Ok(chunk) => self.store_chunk(chunk)?,
-                    Err(e) => self.progress.last_error = Some(e.to_string()),
+                    Ok(chunk) => {
+                        self.retry.remove(&start);
+                        self.store_chunk(chunk)?
+                    }
+                    Err(e) => {
+                        let failures = self.retry.get(&start).map_or(0, |r| r.0) + 1;
+                        tracing::warn!(target: "zcash", "chunk {start}: {e} (failure {failures})");
+                        self.retry.insert(start, (failures, Instant::now() + retry_delay(failures)));
+                        self.progress.last_error = Some(e.to_string());
+                    }
                 }
             }
             Msg::Enhanced(req, r) => {
@@ -244,11 +264,17 @@ impl Syncer {
                 self.head_in_flight = false;
                 match r {
                     Ok(blocks) => {
+                        self.head_retry = (0, None);
                         self.progress.blocks_fetched += blocks.len() as u64;
                         let _ = first;
                         self.cache.insert_blocks(&blocks)?;
                     }
-                    Err(e) => self.progress.last_error = Some(e.to_string()),
+                    Err(e) => {
+                        let failures = self.head_retry.0 + 1;
+                        tracing::warn!(target: "zcash", "head from {first}: {e} (failure {failures})");
+                        self.head_retry = (failures, Some(Instant::now() + retry_delay(failures)));
+                        self.progress.last_error = Some(e.to_string());
+                    }
                 }
             }
         }
@@ -351,7 +377,8 @@ impl Syncer {
     fn plan_downloads(&mut self, db: &Db, tip: u32) -> Result<(), SyncError> {
         let tip_chunk = grid_floor(tip);
         // The tip chunk grows block by block; fetch what is new since last time.
-        if !self.head_in_flight && self.cache.chunk_end(tip_chunk)?.is_some() {
+        let head_due = self.head_retry.1.is_none_or(|t| Instant::now() >= t);
+        if !self.head_in_flight && head_due && self.cache.chunk_end(tip_chunk)?.is_some() {
             let have = self.cache.contiguous_end(chunk_first(tip_chunk))?;
             if have <= tip {
                 self.head_in_flight = true;
@@ -374,6 +401,9 @@ impl Syncer {
                 break;
             }
             if self.in_flight.contains(&start) || self.cache.chunk_end(start)?.is_some() {
+                continue;
+            }
+            if self.retry.get(&start).is_some_and(|r| Instant::now() < r.1) {
                 continue;
             }
             let last = if start == tip_chunk { tip } else { start + GRID - 1 };
@@ -552,5 +582,18 @@ impl Syncer {
             }
             Err(e) => Err(SyncError::Db(e.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_back_off_to_a_minute() {
+        let within = |d: Duration, lo: u64| d >= Duration::from_secs(lo) && d <= Duration::from_secs(lo) + Duration::from_secs(lo) / 4;
+        assert!(within(retry_delay(1), 1));
+        assert!(within(retry_delay(3), 4));
+        assert!(within(retry_delay(40), 60));
     }
 }
