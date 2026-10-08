@@ -20,6 +20,12 @@ pub fn grid_floor(h: u32) -> u32 {
     h - h % GRID
 }
 
+/// The first block of the chunk at `start`. Genesis holds no notes, so chunk 0 starts at 1
+/// (only a regtest wallet is born that low).
+pub fn chunk_first(start: u32) -> u32 {
+    start.max(1)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
     #[error(transparent)]
@@ -202,6 +208,7 @@ mod tests {
     fn grid() {
         assert_eq!(grid_floor(4_476_424), 4_476_000);
         assert_eq!(grid_floor(4_476_000), 4_476_000);
+        assert_eq!((chunk_first(grid_floor(7)), chunk_first(4_476_000)), (1, 4_476_000));
     }
 
     #[test]

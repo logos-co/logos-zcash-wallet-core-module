@@ -70,3 +70,30 @@ the plugin.
 
 Callers other than the backend are refused. For tests, a `callers.json` in the instance's
 persistence directory can admit more: `{ "modules": [...], "allowHost": true }`.
+
+## Regtest
+
+`tools/regtest/chain.sh` runs a local chain: zebrad 7.0.0-rc.0 or later (regtest disables
+proof of work, so its `generate` RPC mines on demand) and two lightwalletd on loopback.
+`prepare` mines Orchard coinbase before NU6.3, then transparent coinbase, then Ironwood
+coinbase, and matures it all. The wallet joins with proxy `"direct"`, which only a regtest
+wallet accepts, and only for `http://127.0.0.1:` servers. A module instance runs regtest when
+its persistence directory holds `regtest.json`.
+
+```bash
+cd rust-lib
+cargo run --no-default-features --example regtest_keys -- ../tools/regtest/regtest.json > keys.json
+jq -r .phrase keys.json > phrase.txt
+ZEBRAD=... LIGHTWALLETD=... CHAIN_DIR=/tmp/zchain \
+  ../tools/regtest/chain.sh prepare "$(jq -r .orchardUa keys.json)" "$(jq -r .transparent keys.json)"
+REGTEST_HEIGHTS=../tools/regtest/regtest.json REGTEST_PHRASE=phrase.txt \
+REGTEST_RPC=http://127.0.0.1:28232 REGTEST_SERVERS=http://127.0.0.1:29061,http://127.0.0.1:29063 \
+ZCASH_PARAMS_DIR=... cargo test --release --no-default-features --test regtest -- --ignored --nocapture
+```
+
+The test restores the wallet, pays from Ironwood, shields the transparent coinbase, and runs
+the ZIP 318 migration of the Orchard coinbase to the end. Mining to a transparent address
+(`chain.sh start <taddr>`) is fastest while the migration waits on its schedule.
+
+`examples/find_payment.rs` trial-decrypts a block range, the mempool or one transaction
+with a viewing key, outside any wallet: it tells "not on chain" from "on chain but missed".

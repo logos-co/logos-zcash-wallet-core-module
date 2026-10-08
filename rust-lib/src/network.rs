@@ -87,9 +87,20 @@ impl ZNetwork {
         }
     }
 
+    /// Whether a server's reported chain name fits. Zebra names regtest "test", zcashd "regtest".
+    pub fn accepts_lightd_chain(self, name: &str) -> bool {
+        name == self.lightd_chain_name() || (self == ZNetwork::Regtest && name == "test")
+    }
+
     /// The consensus branch ID at `height`, as lightwalletd prints it.
     pub fn branch_id_hex(self, height: BlockHeight) -> String {
         format!("{:08x}", u32::from(consensus::BranchId::for_height(&self, height)))
+    }
+
+    /// Whether a server at `tip` reporting `branch` is on this chain. lightwalletd and Zebra
+    /// report the tip's branch, which lags one block at an upgrade, so the next block's passes too.
+    pub fn accepts_branch(self, branch: &str, tip: u32) -> bool {
+        [tip, tip + 1].iter().any(|h| branch.eq_ignore_ascii_case(&self.branch_id_hex(BlockHeight::from(*h))))
     }
 }
 
@@ -129,5 +140,16 @@ mod tests {
         // Testnet NU7 activated at 4,465,026 (ZIP 259); the server reported 77190ad9 above it.
         assert_eq!(ZNetwork::Test.branch_id_hex(BlockHeight::from(4_476_424)), "77190ad9");
         assert_ne!(ZNetwork::Test.branch_id_hex(BlockHeight::from(4_465_025)), "77190ad9");
+    }
+
+    #[test]
+    fn a_server_reports_its_tips_branch() {
+        let before = ZNetwork::Test.branch_id_hex(BlockHeight::from(4_465_025));
+        // The block below NU7: the tip's branch and the next block's both pass.
+        assert!(ZNetwork::Test.accepts_branch(&before, 4_465_025));
+        assert!(ZNetwork::Test.accepts_branch("77190AD9", 4_465_025));
+        // Past it, the old branch is the chain that split off.
+        assert!(!ZNetwork::Test.accepts_branch(&before, 4_465_026));
+        assert!(ZNetwork::Test.accepts_branch("77190ad9", 4_476_424));
     }
 }
