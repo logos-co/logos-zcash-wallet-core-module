@@ -221,7 +221,7 @@ pub fn status(conn: &mut Connection, params: ZNetwork, account: AccountUuid) -> 
     let Some(last) = list.last() else { return Ok(json!({"ok": true, "active": false})) };
     Ok(json!({
         "ok": true,
-        "active": !matches!(last.status().as_ref(), "Complete" | "Cancelled" | "Superseded" | "Failed"),
+        "active": !last.status().is_terminal(),
         "id": last.id().expose_uuid().to_string(),
         "status": last.status().as_ref(),
         "committedHeight": last.committed_height().map(u32::from),
