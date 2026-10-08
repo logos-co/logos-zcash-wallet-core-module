@@ -656,8 +656,9 @@ fn balances_json<C: std::borrow::Borrow<rusqlite::Connection>>(db: &wallet::Wall
     let Some(b) = summary.account_balances().get(&account) else {
         return Ok(json!({"ok": true, "ready": false}));
     };
-    let shielded_spendable = zat(b.sapling_balance().spendable_value()) + zat(b.orchard_balance().spendable_value()) + zat(b.ironwood_balance().spendable_value());
-    let shielded_total = zat(b.sapling_balance().total()) + zat(b.orchard_balance().total()) + zat(b.ironwood_balance().total());
+    // Orchard is spend-only after NU6.3, so it is reported apart, as funds to migrate.
+    let shielded_spendable = zat(b.sapling_balance().spendable_value()) + zat(b.ironwood_balance().spendable_value());
+    let shielded_total = zat(b.sapling_balance().total()) + zat(b.ironwood_balance().total());
     Ok(json!({
         "ok": true,
         "ready": true,
@@ -670,6 +671,7 @@ fn balances_json<C: std::borrow::Borrow<rusqlite::Connection>>(db: &wallet::Wall
             "transparent": pool_json(&b.unshielded_balance()),
         },
         "shielded": {"spendable": shielded_spendable, "total": shielded_total},
+        "orchardToMigrate": {"spendable": zat(b.orchard_balance().spendable_value()), "total": zat(b.orchard_balance().total())},
         "transparentAddresses": transparent_funds(db, account, summary.chain_tip_height())?,
         "shieldingThreshold": crate::send::SHIELDING_THRESHOLD,
         "total": zat(b.total()),

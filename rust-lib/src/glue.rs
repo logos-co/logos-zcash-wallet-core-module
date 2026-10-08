@@ -34,7 +34,8 @@ pub trait ZcashWalletCoreModule: Send + Sync + 'static {
     fn wallet_status(&self) -> String;
     /// `{ ok, sync: { state, tip, fullyScanned, blocksFetched, blocksScanned, ... } }`.
     fn sync_status(&self) -> String;
-    /// Spendable, pending and total per pool, in zatoshis.
+    /// Spendable, pending and total per pool, in zatoshis. `shielded` is Ironwood plus
+    /// Sapling; Orchard, spend-only after NU6.3, is `orchardToMigrate`.
     fn balances(&self, account: String) -> String;
     /// `{ ok, unified, transparent }`: the current shielded-only Unified Address and
     /// the current transparent address.
