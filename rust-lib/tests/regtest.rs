@@ -5,7 +5,8 @@
 //! REGTEST_HEIGHTS=../tools/regtest/regtest.json REGTEST_PHRASE=phrase.txt REGTEST_RPC=http://127.0.0.1:28232 \
 //! REGTEST_SERVERS=http://127.0.0.1:29061,http://127.0.0.1:29063 ZCASH_PARAMS_DIR=... \
 //!   cargo test --release --no-default-features --test regtest -- --ignored --nocapture
-//! REGTEST_STEPS=sync,send,shield,migrate picks steps (default all).
+//! REGTEST_STEPS=sync,send,shield,migrate picks steps (default all). migrate_now, which moves
+//! every Orchard note at once instead, replaces migrate: REGTEST_STEPS=sync,migrate_now.
 
 use std::process::Command;
 use std::sync::Arc;
@@ -192,7 +193,7 @@ fn send_shield_and_migrate_on_regtest() {
     );
     let steps = std::env::var("REGTEST_STEPS").unwrap_or("sync,send,shield,migrate".into());
     let step = |name: &str| steps.split(',').any(|s| s == name);
-    if !step("send") && !step("shield") && !step("migrate") {
+    if !step("send") && !step("shield") && !step("migrate") && !step("migrate_now") {
         return;
     }
 
@@ -258,6 +259,10 @@ fn send_shield_and_migrate_on_regtest() {
         let orchard_before = b["orchardToMigrate"]["total"].as_u64().unwrap();
         let plan = c.job("plan_migration", json!({}));
         println!("migration plan {}", plan["preview"]);
+        let pv = &plan["preview"];
+        assert!(pv["feeTotal"].as_u64().unwrap_or(0) > 0, "fee total: {pv}");
+        assert!(pv["expiresAt"].as_u64().unwrap_or(0) > u64::from(c.tip()), "expiry: {pv}");
+        assert!(pv["remainder"].is_u64(), "remainder: {pv}");
         let signed = c.job(
             "sign_migration",
             json!({"planId": plan["planId"], "digest": plan["preview"]["digest"], "password": PW}),
@@ -289,5 +294,33 @@ fn send_shield_and_migrate_on_regtest() {
             total(&b, "ironwood")
         );
         assert!(b["orchardToMigrate"]["total"].as_u64().unwrap() < orchard_before);
+    }
+
+    // Migrate now: every spendable Orchard note into Ironwood in one transaction, which
+    // makes the whole amount public.
+    if step("migrate_now") {
+        let b = c.balances();
+        let orchard_before = b["orchardToMigrate"]["spendable"].as_u64().unwrap();
+        let ironwood_before = total(&b, "ironwood");
+        let p = c.job("propose_migrate_now", json!({}));
+        println!("migrate-now preview {}", p["preview"]);
+        let fee = p["preview"]["fee"].as_u64().unwrap();
+        assert_eq!(p["preview"]["migrateNow"], true);
+        assert_eq!(p["preview"]["amountMadePublic"].as_u64(), Some(orchard_before - fee));
+        let sent = c.job(
+            "sign_and_send",
+            json!({"proposalId": p["proposalId"], "password": PW}),
+        );
+        println!("migrated now {sent}");
+        assert_eq!(sent["transactions"][0]["accepted"], true, "{sent}");
+        c.confirm();
+        let b = c.balances();
+        println!(
+            "after migrate now: orchard {orchard_before} -> {}, ironwood {ironwood_before} -> {} (fee {fee})",
+            b["orchardToMigrate"]["spendable"],
+            total(&b, "ironwood")
+        );
+        assert_eq!(b["orchardToMigrate"]["spendable"].as_u64(), Some(0));
+        assert!(total(&b, "ironwood") >= ironwood_before + orchard_before - fee);
     }
 }

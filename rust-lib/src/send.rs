@@ -8,18 +8,18 @@ use std::time::Instant;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use zcash_address::ZcashAddress;
-use zcash_client_backend::data_api::wallet::input_selection::{GreedyInputSelector, SpendPolicy};
+use zcash_client_backend::data_api::wallet::input_selection::{GreedyInputSelector, LockedInputPolicy, SpendPolicy};
 use zcash_client_backend::data_api::wallet::{
-    create_proposed_transactions, propose_transfer, ConfirmationsPolicy, SpendingKeys,
+    create_proposed_transactions, propose_send_max_transfer, propose_transfer, ConfirmationsPolicy, SpendingKeys,
 };
-use zcash_client_backend::data_api::{Account as _, AccountSource, WalletRead};
+use zcash_client_backend::data_api::{Account as _, AccountSource, MaxSpendMode, WalletRead};
 use zcash_client_backend::fees::standard::SingleOutputChangeStrategy;
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule};
 use zcash_client_backend::proposal::Proposal;
 use zcash_client_backend::util::SystemClock;
 use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_sqlite::{AccountUuid, ReceivedNoteId};
-use zcash_keys::keys::UnifiedSpendingKey;
+use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 use zcash_protocol::memo::MemoBytes;
@@ -68,12 +68,14 @@ pub struct SendInput {
 pub enum AnyProposal {
     Send(WalletProposal),
     Shield(Proposal<StandardFeeRule, std::convert::Infallible>),
+    /// Every spendable Orchard note into Ironwood at once: see [`propose_migrate_now`].
+    MigrateNow(WalletProposal),
 }
 
 impl AnyProposal {
     pub fn min_target_height(&self) -> BlockHeight {
         match self {
-            AnyProposal::Send(p) => p.min_target_height().into(),
+            AnyProposal::Send(p) | AnyProposal::MigrateNow(p) => p.min_target_height().into(),
             AnyProposal::Shield(p) => p.min_target_height().into(),
         }
     }
@@ -84,6 +86,11 @@ impl AnyProposal {
             AnyProposal::Shield(p) => {
                 let mut v = preview(params, p, expiry);
                 v["shielding"] = json!(true);
+                v
+            }
+            AnyProposal::MigrateNow(p) => {
+                let mut v = preview(params, p, expiry);
+                v["migrateNow"] = json!(true);
                 v
             }
         }
@@ -206,6 +213,31 @@ pub fn expiry_for(params: &ZNetwork, target: BlockHeight) -> Result<BlockHeight,
     }
 }
 
+/// Migrate now: every spendable Orchard note into Ironwood in one transaction, which makes
+/// the whole amount public. It pays the account's own shielded address, whose Orchard
+/// receiver takes delivery through the Ironwood bundle once Ironwood is active.
+pub fn propose_migrate_now(db: &mut Db, params: ZNetwork, account: AccountUuid) -> Result<WalletProposal, String> {
+    let ua = db
+        .get_last_generated_address_matching(account, UnifiedAddressRequest::SHIELDED)
+        .map_err(|e| e.to_string())?
+        .ok_or("the account has no shielded address")?;
+    let recipient = ZcashAddress::try_from_encoded(&ua.encode(&params)).map_err(|e| e.to_string())?;
+    propose_send_max_transfer::<_, _, _, std::convert::Infallible>(
+        db,
+        &params,
+        account,
+        &[ShieldedPool::Orchard],
+        &StandardFeeRule::Zip317,
+        recipient,
+        None,
+        MaxSpendMode::MaxSpendable,
+        ConfirmationsPolicy::default(),
+        &LockedInputPolicy::Exclude,
+        None,
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Proposes from one shielded pool at a time, Ironwood first. Spending from several
 /// pools at once needs the caller's consent, because it reveals amounts.
 pub fn propose(db: &mut Db, params: ZNetwork, account: AccountUuid, input: &SendInput) -> Result<WalletProposal, String> {
@@ -319,7 +351,7 @@ pub fn sign(
     let mut txids = vec![];
     for (proposal, expiry) in &prepared.items {
         let made = match proposal {
-            AnyProposal::Send(p) => create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
+            AnyProposal::Send(p) | AnyProposal::MigrateNow(p) => create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
                 db, &params, &SystemClock, &mut rng, prover, prover, &keys, OvkPolicy::Sender, p, Some(*expiry),
             )
             .map_err(|e| e.to_string())?,
