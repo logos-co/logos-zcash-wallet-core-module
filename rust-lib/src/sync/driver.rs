@@ -34,6 +34,8 @@ pub struct SyncConfig {
     pub proxy: ProxyAddr,
     /// Chunks go to these servers in turn; the first also answers tip queries.
     pub servers: Vec<String>,
+    /// Where transactions go out; the sync servers unless the routes say otherwise.
+    pub broadcast: Vec<String>,
     pub parallel: usize,
     /// Cached chunks not yet scanned, plus downloads in flight, stay under this.
     pub ahead: usize,
@@ -44,7 +46,8 @@ pub struct SyncConfig {
 
 impl SyncConfig {
     pub fn new(proxy: ProxyAddr, servers: Vec<String>) -> Self {
-        Self { proxy, servers, parallel: 2, ahead: 24, work_cap: 2_000, tip_poll: Duration::from_secs(30) }
+        let broadcast = servers.clone();
+        Self { proxy, servers, broadcast, parallel: 2, ahead: 24, work_cap: 2_000, tip_poll: Duration::from_secs(30) }
     }
 }
 

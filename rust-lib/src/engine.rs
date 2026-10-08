@@ -21,6 +21,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::jobs::{JobState, Jobs};
 use crate::keys::Phrase;
+use crate::net::ipc::LOCAL_NODE_URL;
 use crate::net::socks::ProxyAddr;
 use crate::network::ZNetwork;
 use crate::sync::cache::grid_floor;
@@ -42,6 +43,10 @@ pub type Sink = Arc<dyn Fn(Event) + Send + Sync>;
 pub struct Routes {
     pub proxy: String,
     pub servers: Vec<String>,
+    /// Where transactions go out, if not the sync servers: a wallet syncing from its local
+    /// node still broadcasts through servers over Tor. Empty means nowhere: sends are refused.
+    #[serde(default)]
+    pub broadcast: Option<Vec<String>>,
 }
 
 impl Routes {
@@ -49,20 +54,31 @@ impl Routes {
         if self.servers.is_empty() {
             return Err("no servers".into());
         }
-        // A regtest chain may use a loopback lightwalletd without Tor or TLS.
-        if self.proxy == "direct" {
-            if !crate::network::regtest_configured() || self.servers.iter().any(|s| !s.starts_with("http://127.0.0.1:")) {
+        let broadcast = self.broadcast.clone().unwrap_or_else(|| self.servers.clone());
+        let remote: Vec<&String> = self.servers.iter().chain(&broadcast).filter(|s| *s != LOCAL_NODE_URL).collect();
+        let mut cfg = if remote.is_empty() {
+            // Only the local node, over IPC: no proxy is involved.
+            SyncConfig::new(ProxyAddr::direct(), self.servers.clone())
+        } else if self.proxy == "direct" {
+            // A regtest chain may use a loopback lightwalletd without Tor or TLS.
+            if !crate::network::regtest_configured() || remote.iter().any(|s| !s.starts_with("http://127.0.0.1:")) {
                 return Err("a direct connection is only for a loopback regtest server".into());
             }
-            // A local chain is mined on demand; poll its tip often.
             let mut cfg = SyncConfig::new(ProxyAddr::direct(), self.servers.clone());
             cfg.tip_poll = Duration::from_secs(2);
-            return Ok(cfg);
+            cfg
+        } else {
+            if remote.iter().any(|s| !s.starts_with("https://")) {
+                return Err("servers must be https:// URLs".into());
+            }
+            SyncConfig::new(ProxyAddr::parse(&self.proxy)?, self.servers.clone())
+        };
+        // The local node answers in memory; polling it often costs nothing.
+        if self.servers[0] == LOCAL_NODE_URL {
+            cfg.tip_poll = cfg.tip_poll.min(Duration::from_secs(5));
         }
-        if self.servers.iter().any(|s| !s.starts_with("https://")) {
-            return Err("servers must be https:// URLs".into());
-        }
-        Ok(SyncConfig::new(ProxyAddr::parse(&self.proxy)?, self.servers.clone()))
+        cfg.broadcast = broadcast;
+        Ok(cfg)
     }
 }
 
@@ -450,6 +466,9 @@ impl Engine {
         let prover = self.prover()?;
         let (built, spaced) = self.ask(|tx| WalletCmd::Sign(proposal.to_string(), phrase, prover, tx), Duration::from_secs(300))?;
         let cfg = routes.config()?;
+        if cfg.broadcast.is_empty() {
+            return Err("no server is usable to broadcast through".into());
+        }
         let mut sent = vec![];
         let mut built: Vec<(String, Vec<u8>)> = built;
         if spaced {
@@ -458,7 +477,7 @@ impl Engine {
             for (txid, _) in &later {
                 sent.push(json!({"txid": txid, "accepted": null, "scheduled": true}));
             }
-            let (servers, proxy) = (cfg.servers.clone(), cfg.proxy.clone());
+            let (servers, proxy) = (cfg.broadcast.clone(), cfg.proxy.clone());
             self.rt.spawn(async move {
                 for (txid, raw) in later {
                     let wait = rand::RngExt::random_range(&mut rand::rng(), 120..600);
@@ -471,12 +490,12 @@ impl Engine {
         }
         for (txid, raw) in built {
             let mut outcome = json!({"txid": txid, "accepted": false});
-            for server in &cfg.servers {
+            for server in &cfg.broadcast {
                 match self.rt.block_on(fetch::send_transaction(server, &cfg.proxy, raw.clone())) {
                     Ok((0, _)) => {
                         outcome = json!({"txid": txid, "accepted": true, "server": server});
-                        // Servers in the route table are one per operator: the next one checks.
-                        if let Some(other) = cfg.servers.iter().find(|s| *s != server).cloned() {
+                        // Another operator checks, or the local node when it syncs the wallet.
+                        if let Some(other) = cfg.broadcast.iter().chain(&cfg.servers).find(|s| *s != server).cloned() {
                             let (proxy, raw, id) = (cfg.proxy.clone(), raw.clone(), txid_bytes(&txid));
                             self.rt.spawn(async move {
                                 let note = fetch::confirm_elsewhere(&other, &proxy, id, raw).await;
@@ -877,9 +896,16 @@ fn wallet_loop(
         if syncer.progress.state == "synced" && !paused_flag.exists() && last_drive.elapsed() >= drive_every {
             last_drive = Instant::now();
             let (rt, cfg) = (&net.0, &net.1);
-            // Broadcast through a server other than the one syncing, when there is one.
-            let server = cfg.servers.get(1).unwrap_or(&cfg.servers[0]).clone();
+            // Broadcast through the routes' broadcast servers, else one other than the one syncing.
+            let server = if cfg.broadcast != cfg.servers {
+                cfg.broadcast.first().cloned().unwrap_or_default()
+            } else {
+                cfg.servers.get(1).unwrap_or(&cfg.servers[0]).clone()
+            };
             let mut send = |raw: Vec<u8>| -> Result<(bool, String), String> {
+                if server.is_empty() {
+                    return Err("no server is usable to broadcast through".into());
+                }
                 rt.block_on(fetch::send_transaction(&server, &cfg.proxy, raw))
                     .map(|(code, msg)| (code == 0, msg))
                     .map_err(|e| e.to_string())
@@ -922,6 +948,34 @@ fn wallet_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn routes(proxy: &str, servers: &[&str], broadcast: &[&str]) -> Routes {
+        Routes {
+            proxy: proxy.into(),
+            servers: servers.iter().map(|s| s.to_string()).collect(),
+            broadcast: (!broadcast.is_empty()).then(|| broadcast.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    #[test]
+    fn local_node_routes() {
+        let tor = "socks5h://127.0.0.1:9050";
+        // Sync from the local node, broadcast over Tor.
+        let cfg = routes(tor, &[LOCAL_NODE_URL], &["https://zec.rocks:443"]).config().unwrap();
+        assert_eq!((cfg.servers[0].as_str(), cfg.broadcast[0].as_str()), (LOCAL_NODE_URL, "https://zec.rocks:443"));
+        assert!(cfg.tip_poll <= Duration::from_secs(5));
+        // Only the local node: no proxy needed, and broadcasts go to it too.
+        let cfg = routes("", &[LOCAL_NODE_URL], &[]).config().unwrap();
+        assert!(cfg.proxy.is_direct() && cfg.broadcast == vec![LOCAL_NODE_URL.to_string()]);
+        // Anything remote still needs Tor; plain http and other modules are refused.
+        assert!(routes("", &[LOCAL_NODE_URL], &["https://zec.rocks:443"]).config().is_err());
+        assert!(routes(tor, &[LOCAL_NODE_URL], &["http://zec.rocks:80"]).config().is_err());
+        assert!(routes(tor, &["logos://other_module"], &[]).config().is_err());
+        // An empty broadcast list syncs but leaves nothing to send through.
+        let mut r = routes(tor, &[LOCAL_NODE_URL], &[]);
+        r.broadcast = Some(vec![]);
+        assert!(r.config().unwrap().broadcast.is_empty());
+    }
 
     #[test]
     fn address_kinds() {

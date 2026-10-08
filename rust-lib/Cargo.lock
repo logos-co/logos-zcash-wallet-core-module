@@ -3965,11 +3965,15 @@ name = "zcash_wallet_core"
 version = "0.1.0"
 dependencies = [
  "age",
+ "base64 0.22.1",
  "bip0039",
  "blake2b_simd",
+ "bytes",
  "futures-util",
  "hex",
  "http",
+ "http-body",
+ "http-body-util",
  "hyper-util",
  "logos-rust-sdk",
  "orchard",

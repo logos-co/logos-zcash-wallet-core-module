@@ -215,7 +215,36 @@ impl ZcashWalletCoreModule for ZcashWalletCoreModuleImpl {
                 .flatten()
                 .find(|d| d.join("sapling-spend.params").is_file())
         });
+        crate::net::ipc::set_local_node(Arc::new(ZebradIpc));
         let _ = self.engine.set(Engine::new(dir.join("wallets"), sink, None, params));
+    }
+}
+
+/// zebrad_module, an OPTIONAL dependency: the local node, reached over Logos IPC. Every
+/// failure to reach it is answered as UNAVAILABLE, which the sync loop backs off from.
+struct ZebradIpc;
+
+/// The node bounds a call at 120 s; the rest is IPC slack.
+const LOCAL_NODE_BUDGET: std::time::Duration = std::time::Duration::from_secs(150);
+
+impl crate::net::ipc::GrpcCall for ZebradIpc {
+    fn call(&self, path: &str, body: &[u8]) -> (i32, String, Vec<u8>) {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let unavailable = |e: String| (14, e, Vec::new());
+        let reply = match zebrad_module::ZebradModuleClient::new().grpc_with_timeout(path, &b64.encode(body), LOCAL_NODE_BUDGET) {
+            Ok(r) => r,
+            Err(e) => return unavailable(format!("zebrad_module: {e}")),
+        };
+        let v: Value = match serde_json::from_str(&reply) {
+            Ok(v) => v,
+            Err(e) => return unavailable(format!("zebrad_module: {e}")),
+        };
+        if v["ok"] != true {
+            return unavailable(v["error"].as_str().unwrap_or("zebrad_module refused the call").to_string());
+        }
+        let out = v["body"].as_str().and_then(|s| b64.decode(s).ok()).unwrap_or_default();
+        (v["status"].as_i64().unwrap_or(2) as i32, v["message"].as_str().unwrap_or("").to_string(), out)
     }
 }
 
