@@ -21,6 +21,7 @@ use zcash_protocol::consensus::BlockHeight;
 use zcash_transparent::address::TransparentAddress;
 
 use super::cache::{chunk_first, grid_floor, BlockCache, GRID};
+use super::crosscheck::{self, CrossCheck, Verdict};
 use super::enhance::{self, Fetched};
 use super::fetch::{self, Chunk};
 use super::frontier::{self, FrontierError};
@@ -32,6 +33,10 @@ use crate::wallet::Db;
 
 /// Blocks within this distance of the tip stay cached for reorgs.
 pub const HEAD: u32 = 100;
+
+/// Reading from the local node, a server checks it this often, and sooner after a mismatch.
+const CROSS_CHECK_EVERY: Duration = Duration::from_secs(120);
+const RECHECK_AFTER: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -88,6 +93,8 @@ pub struct Progress {
     pub blocks_left: Option<u64>,
     pub chunks_cached: usize,
     pub last_error: Option<String>,
+    /// Reading from the local node: how it compared with a server last time.
+    pub cross_check: Option<CrossCheck>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -108,6 +115,7 @@ enum Msg {
     Enhanced(TransactionDataRequest, Result<Fetched, NetError>),
     /// Local node only: an address's transactions up to a height.
     Received(TransparentAddress, u32, Result<Vec<(Transaction, Option<BlockHeight>)>, NetError>),
+    CrossCheck(Result<CrossCheck, NetError>),
 }
 
 /// What a sync error came from. The next success of the same source clears it.
@@ -123,6 +131,8 @@ pub enum ErrorSource {
     /// The engine's: a failed step, and the migration.
     Step,
     Migration,
+    /// The local node against a server.
+    CrossCheck,
 }
 
 /// Errors by source, so the one shown is the newest that still stands.
@@ -184,6 +194,11 @@ pub struct Syncer {
     t_pause: Option<Instant>,
     /// When scanning began this session, and how many blocks since, for the ETA.
     pace: Option<(Instant, u64)>,
+    /// Local node only: the next cross-check, the server it goes to, and a first mismatch.
+    check_due: Option<Instant>,
+    check_in_flight: bool,
+    next_checker: usize,
+    differed: bool,
     errors: Errors,
     pub progress: Progress,
 }
@@ -225,6 +240,10 @@ impl Syncer {
             t_failures: 0,
             t_pause: None,
             pace: None,
+            check_due: None,
+            check_in_flight: false,
+            next_checker: 0,
+            differed: false,
             errors: Errors::default(),
             progress: Progress { state: "starting".into(), birthday, ..Default::default() },
         }
@@ -269,6 +288,7 @@ impl Syncer {
             self.progress.state = "connecting".into();
             return Ok(Step::Waiting);
         };
+        self.cross_check_if_due();
         if !self.roots_loaded {
             self.load_subtree_roots(db)?;
             self.roots_loaded = true;
@@ -302,6 +322,22 @@ impl Syncer {
         let (server, proxy, tx) = (self.cfg.servers[0].clone(), self.cfg.proxy.clone(), self.tx.clone());
         self.rt.spawn(async move {
             let _ = tx.send(Msg::Tip(fetch::tip_and_info(&server, &proxy, Isolation::fresh()).await));
+        });
+    }
+
+    /// Reading from the local node, the servers that send transactions take turns checking it.
+    fn cross_check_if_due(&mut self) {
+        let checkers: Vec<String> = self.cfg.broadcast.iter().filter(|s| *s != LOCAL_NODE_URL).cloned().collect();
+        if !self.local() || checkers.is_empty() || self.check_in_flight || self.check_due.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        let server = checkers[self.next_checker % checkers.len()].clone();
+        self.next_checker += 1;
+        self.check_in_flight = true;
+        self.check_due = Some(Instant::now() + CROSS_CHECK_EVERY);
+        let (proxy, tx, net) = (self.cfg.proxy.clone(), self.tx.clone(), self.params);
+        self.rt.spawn(async move {
+            let _ = tx.send(Msg::CrossCheck(crosscheck::check(net, &server, &proxy).await));
         });
     }
 
@@ -372,6 +408,28 @@ impl Syncer {
                         self.t_pause = Some(Instant::now() + retry_delay(self.t_failures));
                         self.fail(ErrorSource::Transparent, e);
                     }
+                }
+            }
+            Msg::CrossCheck(r) => {
+                self.check_in_flight = false;
+                match r {
+                    // Once may be a block arriving between the reads; twice running is a fork.
+                    Ok(c) if c.verdict == Verdict::Differs && !self.differed => {
+                        tracing::warn!(target: "zcash", "cross-check: {} differs at {}; checking again", c.server, c.node_tip.min(c.server_tip));
+                        self.differed = true;
+                        self.check_due = Some(Instant::now() + RECHECK_AFTER);
+                    }
+                    Ok(c) => {
+                        self.differed = c.verdict == Verdict::Differs;
+                        if self.differed {
+                            let at = c.node_tip.min(c.server_tip);
+                            self.fail(ErrorSource::CrossCheck, format!("your node and {} have different blocks at {at}: one of them is on a false chain", c.server));
+                        } else {
+                            self.succeed(ErrorSource::CrossCheck);
+                        }
+                        self.progress.cross_check = Some(c);
+                    }
+                    Err(e) => tracing::warn!(target: "zcash", "cross-check: {e}"),
                 }
             }
             Msg::Tail(start, first, r) => {

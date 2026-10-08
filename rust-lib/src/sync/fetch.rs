@@ -9,7 +9,7 @@ use crate::net::socks::{Isolation, ProxyAddr};
 
 pub const ALL_POOLS: [PoolType; 4] = [PoolType::Transparent, PoolType::Sapling, PoolType::Orchard, PoolType::Ironwood];
 
-fn status(server: &str) -> impl Fn(tonic::Status) -> NetError + '_ {
+pub(super) fn status(server: &str) -> impl Fn(tonic::Status) -> NetError + '_ {
     move |status| NetError::Status { server: server.into(), status }
 }
 
