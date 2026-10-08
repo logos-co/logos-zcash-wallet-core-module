@@ -167,7 +167,7 @@ enum WalletCmd {
     SignMigration(String, String, Phrase, Sender<Result<Value, String>>),
     MigrationControl(&'static str, Sender<Result<Value, String>>),
     MigrationStatus(Sender<Result<Value, String>>),
-    Sign(String, Phrase, Arc<zcash_proofs::prover::LocalTxProver>, Sender<Result<Vec<(String, Vec<u8>)>, String>>),
+    Sign(String, Phrase, Arc<zcash_proofs::prover::LocalTxProver>, Sender<Result<(Vec<(String, Vec<u8>)>, bool), String>>),
 }
 
 struct OpenWallet {
@@ -438,9 +438,27 @@ impl Engine {
         let (dir, routes) = self.with_open(|w| Ok((WalletDir { path: w.dir.path.clone() }, w.routes.clone())))?;
         let phrase = dir.unseal_phrase(password).map_err(|e| e.to_string())?;
         let prover = self.prover()?;
-        let built = self.ask(|tx| WalletCmd::Sign(proposal.to_string(), phrase, prover, tx), Duration::from_secs(300))?;
+        let (built, spaced) = self.ask(|tx| WalletCmd::Sign(proposal.to_string(), phrase, prover, tx), Duration::from_secs(300))?;
         let cfg = routes.config()?;
         let mut sent = vec![];
+        let mut built: Vec<(String, Vec<u8>)> = built;
+        if spaced {
+            // The first goes now; the rest follow 2-10 minutes apart, each on its own circuit.
+            let later: Vec<(String, Vec<u8>)> = built.split_off(1);
+            for (txid, _) in &later {
+                sent.push(json!({"txid": txid, "accepted": null, "scheduled": true}));
+            }
+            let (servers, proxy) = (cfg.servers.clone(), cfg.proxy.clone());
+            self.rt.spawn(async move {
+                for (txid, raw) in later {
+                    let wait = rand::RngExt::random_range(&mut rand::rng(), 120..600);
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                    let server = crate::sync::enhance::pick(&servers).to_string();
+                    let r = fetch::send_transaction(&server, &proxy, raw).await;
+                    tracing::info!(target: "zcash", "scheduled shielding {txid}: {r:?}");
+                }
+            });
+        }
         for (txid, raw) in built {
             let mut outcome = json!({"txid": txid, "accepted": false});
             for server in &cfg.servers {
@@ -666,13 +684,26 @@ fn keep(
     prepared: &mut std::collections::HashMap<String, crate::send::Prepared>,
     next: &mut u64,
     params: &ZNetwork,
-    proposal: crate::send::AnyProposal,
+    proposals: Vec<crate::send::AnyProposal>,
 ) -> Result<Value, String> {
-    let expiry = crate::send::expiry_for(params, proposal.min_target_height())?;
-    let preview = proposal.preview(params, expiry);
+    let mut items = vec![];
+    let mut previews = vec![];
+    for p in proposals {
+        let expiry = crate::send::expiry_for(params, p.min_target_height())?;
+        previews.push(p.preview(params, expiry));
+        items.push((p, expiry));
+    }
+    let preview = if previews.len() == 1 {
+        previews.pop().expect("one")
+    } else {
+        let fee: u64 = previews.iter().filter_map(|v| v["fee"].as_u64()).sum();
+        json!({"shielding": true, "batch": previews, "fee": fee, "transactions": items.len(),
+               "spacing": "each transaction goes out on its own circuit, 2 to 10 minutes after the previous one",
+               "ttlSecs": crate::send::PREVIEW_TTL_SECS})
+    };
     *next += 1;
     let id = format!("p{next}");
-    prepared.insert(id.clone(), crate::send::Prepared { created: Instant::now(), proposal, expiry, preview: preview.clone() });
+    prepared.insert(id.clone(), crate::send::Prepared { created: Instant::now(), items, preview: preview.clone() });
     Ok(json!({"proposalId": id, "preview": preview}))
 }
 
@@ -714,12 +745,17 @@ fn wallet_loop(
                 WalletCmd::Propose(input, reply) => {
                     let r = crate::send::propose(&mut db, params, account, &input)
                         .map(crate::send::AnyProposal::Send)
-                        .and_then(|p| keep(&mut prepared, &mut next_proposal, &params, p));
+                        .and_then(|p| keep(&mut prepared, &mut next_proposal, &params, vec![p]));
                     let _ = reply.send(r);
                 }
                 WalletCmd::ProposeShielding(address, reply) => {
-                    let r = crate::send::propose_shield(&mut db, params, account, &address)
-                        .and_then(|p| keep(&mut prepared, &mut next_proposal, &params, p));
+                    // An empty address shields every address above the threshold, one transaction each.
+                    let r = if address.trim().is_empty() {
+                        crate::send::propose_shield_all(&mut db, params, account)
+                    } else {
+                        crate::send::propose_shield(&mut db, params, account, &address).map(|p| vec![p])
+                    }
+                    .and_then(|ps| keep(&mut prepared, &mut next_proposal, &params, ps));
                     let _ = reply.send(r);
                 }
                 WalletCmd::PlanMigration(reply) => {
@@ -771,7 +807,7 @@ fn wallet_loop(
                     let r = match prepared.remove(&id) {
                         None => Err("unknown or expired proposal".to_string()),
                         Some(p) => crate::send::sign(&mut db, params, account, &p, &phrase, &prover)
-                            .map(|v| v.into_iter().map(|(txid, raw)| (txid.to_string(), raw)).collect()),
+                            .map(|v| (v.into_iter().map(|(txid, raw)| (txid.to_string(), raw)).collect(), p.spaced())),
                     };
                     drop(phrase);
                     let _ = reply.send(r);

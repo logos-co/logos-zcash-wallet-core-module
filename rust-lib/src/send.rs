@@ -92,9 +92,36 @@ impl AnyProposal {
 
 pub struct Prepared {
     pub created: Instant,
-    pub proposal: AnyProposal,
-    pub expiry: BlockHeight,
+    /// Each proposal with its expiry; several only when shielding several addresses.
+    pub items: Vec<(AnyProposal, BlockHeight)>,
     pub preview: Value,
+}
+
+impl Prepared {
+    /// Several transactions go out minutes apart, so their timing does not tie the
+    /// addresses together.
+    pub fn spaced(&self) -> bool {
+        self.items.len() > 1
+    }
+}
+
+/// One shielding proposal per transparent address that holds enough to shield.
+pub fn propose_shield_all(db: &mut Db, params: ZNetwork, account: AccountUuid) -> Result<Vec<AnyProposal>, String> {
+    use zcash_keys::encoding::AddressCodec;
+    let tip = db.chain_height().map_err(|e| e.to_string())?.ok_or("the wallet is not synced")?;
+    let balances = db
+        .get_transparent_balances(account, (tip + 1).into(), ConfirmationsPolicy::default())
+        .map_err(|e| e.to_string())?;
+    let mut addrs: Vec<String> = balances
+        .into_iter()
+        .filter(|(_, (_, b))| b.spendable_value().into_u64() >= SHIELDING_THRESHOLD)
+        .map(|(a, _)| a.encode(&params))
+        .collect();
+    addrs.sort();
+    if addrs.is_empty() {
+        return Err("no transparent address holds enough to shield".into());
+    }
+    addrs.iter().map(|a| propose_shield(db, params, account, a)).collect()
 }
 
 /// Transparent funds are offered for shielding above this amount (0.001 ZEC).
@@ -289,16 +316,20 @@ pub fn sign(
     let usk = UnifiedSpendingKey::from_seed(&params, phrase.seed().expose_secret(), index).map_err(|e| format!("{e:?}"))?;
     let mut rng = crate::wallet::new_rng();
     let keys = SpendingKeys::new(usk);
-    let txids = match &prepared.proposal {
-        AnyProposal::Send(p) => create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
-            db, &params, &SystemClock, &mut rng, prover, prover, &keys, OvkPolicy::Sender, p, Some(prepared.expiry),
-        )
-        .map_err(|e| e.to_string())?,
-        AnyProposal::Shield(p) => create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
-            db, &params, &SystemClock, &mut rng, prover, prover, &keys, OvkPolicy::Sender, p, Some(prepared.expiry),
-        )
-        .map_err(|e| e.to_string())?,
-    };
+    let mut txids = vec![];
+    for (proposal, expiry) in &prepared.items {
+        let made = match proposal {
+            AnyProposal::Send(p) => create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
+                db, &params, &SystemClock, &mut rng, prover, prover, &keys, OvkPolicy::Sender, p, Some(*expiry),
+            )
+            .map_err(|e| e.to_string())?,
+            AnyProposal::Shield(p) => create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
+                db, &params, &SystemClock, &mut rng, prover, prover, &keys, OvkPolicy::Sender, p, Some(*expiry),
+            )
+            .map_err(|e| e.to_string())?,
+        };
+        txids.extend(made);
+    }
     let mut out = vec![];
     for txid in txids {
         let tx = db.get_transaction(txid).map_err(|e| e.to_string())?.ok_or("built transaction missing")?;
