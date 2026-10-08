@@ -54,7 +54,10 @@ impl Routes {
             if !crate::network::regtest_configured() || self.servers.iter().any(|s| !s.starts_with("http://127.0.0.1:")) {
                 return Err("a direct connection is only for a loopback regtest server".into());
             }
-            return Ok(SyncConfig::new(ProxyAddr::direct(), self.servers.clone()));
+            // A local chain is mined on demand; poll its tip often.
+            let mut cfg = SyncConfig::new(ProxyAddr::direct(), self.servers.clone());
+            cfg.tip_poll = Duration::from_secs(2);
+            return Ok(cfg);
         }
         if self.servers.iter().any(|s| !s.starts_with("https://")) {
             return Err("servers must be https:// URLs".into());
@@ -761,6 +764,8 @@ fn wallet_loop(
     let mut prepared: std::collections::HashMap<String, crate::send::Prepared> = Default::default();
     let mut next_proposal = 0u64;
     let params = *db.params();
+    // A regtest chain is mined on demand, so its migration is driven faster.
+    let drive_every = Duration::from_secs(if params == ZNetwork::Regtest { 3 } else { 30 });
     while !stop.load(Ordering::SeqCst) {
         prepared.retain(|_, p| p.created.elapsed().as_secs() <= crate::send::PREVIEW_TTL_SECS);
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -866,8 +871,8 @@ fn wallet_loop(
         }
         // Plans expire with their anchor bucket: 144 blocks is about an hour after NU7.
         plans.retain(|_, (_, _, t)| t.elapsed() < Duration::from_secs(3600));
-        // The migration moves only on a synced wallet, at most every 30 s, between sync steps.
-        if syncer.progress.state == "synced" && !paused_flag.exists() && last_drive.elapsed() >= Duration::from_secs(30) {
+        // The migration moves only on a synced wallet, at most every 30 s (3 s on regtest), between sync steps.
+        if syncer.progress.state == "synced" && !paused_flag.exists() && last_drive.elapsed() >= drive_every {
             last_drive = Instant::now();
             let (rt, cfg) = (&net.0, &net.1);
             // Broadcast through a server other than the one syncing, when there is one.
@@ -891,7 +896,13 @@ fn wallet_loop(
                     v["lastStep"] = json!(format!("{other:?}"));
                     sink(Event::MigrationChanged(v));
                 }
-                Err(e) => syncer.progress.last_error = Some(format!("migration: {e}")),
+                Err(e) => {
+                    let e = format!("migration: {e}");
+                    if syncer.progress.last_error.as_deref() != Some(e.as_str()) {
+                        tracing::warn!(target: "zcash", "{e}");
+                    }
+                    syncer.progress.last_error = Some(e);
+                }
             }
         }
         if last_balance_check.elapsed() >= Duration::from_secs(2) {
