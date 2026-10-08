@@ -14,8 +14,11 @@ use zcash_client_backend::data_api::wallet::decrypt_and_store_transaction;
 use zcash_client_backend::data_api::{TransactionDataRequest, WalletCommitmentTrees, WalletRead, WalletWrite};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::{GetSubtreeRootsArg, LightdInfo, ShieldedProtocol};
+use zcash_keys::encoding::AddressCodec;
 use zcash_primitives::merkle_tree::HashSer;
+use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::BlockHeight;
+use zcash_transparent::address::TransparentAddress;
 
 use super::cache::{chunk_first, grid_floor, BlockCache, GRID};
 use super::enhance::{self, Fetched};
@@ -103,6 +106,8 @@ enum Msg {
     Tail(u32, u32, Result<Vec<CompactBlock>, NetError>),
     Tip(Result<(u32, LightdInfo), NetError>),
     Enhanced(TransactionDataRequest, Result<Fetched, NetError>),
+    /// Local node only: an address's transactions up to a height.
+    Received(TransparentAddress, u32, Result<Vec<(Transaction, Option<BlockHeight>)>, NetError>),
 }
 
 pub struct Syncer {
@@ -125,6 +130,12 @@ pub struct Syncer {
     last_end: Option<ChainState>,
     enh_in_flight: HashSet<TransactionDataRequest>,
     last_enh: Option<Instant>,
+    /// Local node only: the height each transparent address is looked up to, lookups in
+    /// flight, and a pause after failures.
+    t_checked: HashMap<TransparentAddress, u32>,
+    t_in_flight: HashSet<TransparentAddress>,
+    t_failures: u32,
+    t_pause: Option<Instant>,
     /// When scanning began this session, and how many blocks since, for the ETA.
     pace: Option<(Instant, u64)>,
     pub progress: Progress,
@@ -162,6 +173,10 @@ impl Syncer {
             last_end: None,
             enh_in_flight: HashSet::new(),
             last_enh: None,
+            t_checked: HashMap::new(),
+            t_in_flight: HashSet::new(),
+            t_failures: 0,
+            t_pause: None,
             pace: None,
             progress: Progress { state: "starting".into(), birthday, ..Default::default() },
         }
@@ -261,6 +276,24 @@ impl Syncer {
                 match r {
                     Ok(fetched) => self.apply_enhancement(db, req, fetched)?,
                     Err(e) => self.progress.last_error = Some(e.to_string()),
+                }
+            }
+            Msg::Received(address, upto, r) => {
+                self.t_in_flight.remove(&address);
+                match r {
+                    Ok(txs) => {
+                        for (tx, height) in &txs {
+                            decrypt_and_store_transaction(&self.params, db, tx, *height).map_err(db_err)?;
+                        }
+                        self.t_checked.insert(address, upto);
+                        self.t_failures = 0;
+                    }
+                    Err(e) => {
+                        self.t_failures += 1;
+                        tracing::warn!(target: "zcash", "transparent lookup: {e} (failure {})", self.t_failures);
+                        self.t_pause = Some(Instant::now() + retry_delay(self.t_failures));
+                        self.progress.last_error = Some(e.to_string());
+                    }
                 }
             }
             Msg::Tail(start, first, r) => {
@@ -450,14 +483,21 @@ impl Syncer {
     }
 
     /// Sends out what the wallet asks to learn, a few at a time.
+    fn local(&self) -> bool {
+        self.cfg.servers.first().is_some_and(|s| s == LOCAL_NODE_URL)
+    }
+
     fn plan_enhancements(&mut self, db: &Db, tip: u32) -> Result<(), SyncError> {
         // The delays only keep a server from tying requests together; the local node is ours.
-        let local = self.cfg.servers.first().is_some_and(|s| s == LOCAL_NODE_URL);
+        let local = self.local();
         let (every, at_once) = if local { (Duration::from_secs(1), 16) } else { (Duration::from_secs(10), 4) };
         if self.last_enh.is_some_and(|t| t.elapsed() < every) {
             return Ok(());
         }
         self.last_enh = Some(Instant::now());
+        if local {
+            self.plan_receipts(db, tip, at_once)?;
+        }
         let requests = db.transaction_data_requests().map_err(db_err)?;
         self.progress.details_pending = requests.len();
         let now = SystemTime::now();
@@ -478,6 +518,33 @@ impl Syncer {
                 let r = enhance::fetch(params, &server, &proxy, &req, tip).await;
                 let _ = tx.send(Msg::Enhanced(req, r));
             });
+        }
+        Ok(())
+    }
+
+    /// The local node's compact blocks carry no transparent data (Zebra 7.0.0-rc.0 ignores
+    /// poolTypes), so funds to the wallet's transparent addresses are looked up there by address.
+    /// At a remote server those lookups would tie the addresses together; this node is ours.
+    fn plan_receipts(&mut self, db: &Db, tip: u32, at_once: usize) -> Result<(), SyncError> {
+        if self.t_pause.is_some_and(|t| Instant::now() < t) {
+            return Ok(());
+        }
+        let from = self.progress.birthday.max(1);
+        for account in db.get_account_ids().map_err(db_err)? {
+            for address in db.get_transparent_receivers(account, true, true).map_err(db_err)?.into_keys() {
+                if self.t_in_flight.len() >= at_once {
+                    return Ok(());
+                }
+                let checked = self.t_checked.get(&address).copied().unwrap_or(from - 1);
+                if checked >= tip || !self.t_in_flight.insert(address) {
+                    continue;
+                }
+                let (server, proxy, tx, params) = (self.cfg.servers[0].clone(), self.cfg.proxy.clone(), self.tx.clone(), self.params);
+                self.rt.spawn(async move {
+                    let r = enhance::received(params, &server, &proxy, address.encode(&params), checked + 1, tip, tip).await;
+                    let _ = tx.send(Msg::Received(address, tip, r));
+                });
+            }
         }
         Ok(())
     }
