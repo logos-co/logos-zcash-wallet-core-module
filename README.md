@@ -98,8 +98,10 @@ REGTEST_RPC=http://127.0.0.1:28232 REGTEST_SERVERS=http://127.0.0.1:29061,http:/
 ZCASH_PARAMS_DIR=... cargo test --release --no-default-features --test regtest -- --ignored --nocapture
 ```
 
-The test restores the wallet, pays from Ironwood, shields the transparent coinbase, and runs
-the ZIP 318 migration of the Orchard coinbase to the end. Mining to a transparent address
+The test restores the wallet and pays from Ironwood. It then pays itself 100 zatoshis at a
+transparent address, which it must report as uneconomic: worth less than spending them would
+cost. It shields the transparent coinbase and runs the ZIP 318 migration of the Orchard
+coinbase to the end. Mining to a transparent address
 (`chain.sh start <taddr>`) is fastest while the migration waits on its schedule.
 
 `examples/find_payment.rs` trial-decrypts a block range, the mempool or one transaction

@@ -160,6 +160,12 @@ pub fn propose_shield(db: &mut Db, params: ZNetwork, account: AccountUuid, addre
     .map_err(|e| e.to_string())
 }
 
+/// A transparent output worth no more than ZIP 317 charges to spend it: wallets leave it out of
+/// their balance (zcash_client_sqlite's uneconomic value), so its recipient cannot use it.
+pub fn uneconomic(pool: PoolType, amount: u64) -> bool {
+    pool == PoolType::Transparent && amount <= zcash_primitives::transaction::fees::zip317::MARGINAL_FEE.into_u64()
+}
+
 fn pool_name(p: PoolType) -> &'static str {
     match p {
         PoolType::Transparent => "transparent",
@@ -281,6 +287,7 @@ pub fn preview<N>(params: &ZNetwork, p: &Proposal<StandardFeeRule, N>, expiry: B
                 "address": pay.recipient_address().encode(),
                 "amount": amount,
                 "pool": pool_name(pool),
+                "uneconomic": uneconomic(pool, amount),
                 "memo": pay.memo().and_then(|m| String::from_utf8(m.as_slice().iter().copied().take_while(|b| *b != 0).collect()).ok()),
             }));
         }
@@ -386,6 +393,13 @@ mod tests {
         assert_eq!(expiry_for(&p, nu7 - 100).unwrap(), nu7 - 100 + 40);
         assert_eq!(expiry_for(&p, nu7 - 20).unwrap(), nu7 - 1);
         assert!(expiry_for(&p, nu7 - 2).is_err());
+    }
+
+    #[test]
+    fn transparent_dust_is_uneconomic() {
+        assert!(uneconomic(PoolType::Transparent, 100) && uneconomic(PoolType::Transparent, 5_000));
+        assert!(!uneconomic(PoolType::Transparent, 5_001));
+        assert!(!uneconomic(PoolType::Shielded(ShieldedPool::Ironwood), 100));
     }
 
     #[test]

@@ -191,9 +191,9 @@ fn send_shield_and_migrate_on_regtest() {
         b["shielded"]["total"].as_u64().unwrap(),
         total(&b, "ironwood") + total(&b, "sapling")
     );
-    let steps = std::env::var("REGTEST_STEPS").unwrap_or("sync,send,shield,migrate".into());
+    let steps = std::env::var("REGTEST_STEPS").unwrap_or("sync,send,dust,shield,migrate".into());
     let step = |name: &str| steps.split(',').any(|s| s == name);
-    if !step("send") && !step("shield") && !step("migrate") && !step("migrate_now") {
+    if !step("send") && !step("dust") && !step("shield") && !step("migrate") && !step("migrate_now") {
         return;
     }
 
@@ -230,6 +230,29 @@ fn send_shield_and_migrate_on_regtest() {
             .cloned();
         println!("history row {}", row.clone().unwrap_or_default());
         assert_eq!(row.map(|r| r["kind"].clone()), Some(json!("sent")));
+    }
+
+    // 100 zatoshis to its own transparent address, less than spending them would cost: the
+    // preview flags it, and the wallet reports it as uneconomic, outside every balance.
+    if step("dust") {
+        let to = c.engine.addresses()["transparent"].as_str().unwrap().to_string();
+        let p = c.job("propose", json!({"send": {"recipients": [{"address": to, "amount": 100}]}}));
+        assert_eq!(p["preview"]["recipients"][0]["uneconomic"], true, "{}", p["preview"]);
+        let sent = c.job("sign_and_send", json!({"proposalId": p["proposalId"], "password": PW}));
+        assert_eq!(sent["transactions"][0]["accepted"], true, "{sent}");
+        let t1 = Instant::now();
+        let b = loop {
+            c.confirm();
+            let b = c.balances();
+            if b["pools"]["transparent"]["uneconomic"].as_u64().unwrap_or(0) >= 100 {
+                break b;
+            }
+            assert!(t1.elapsed() < Duration::from_secs(120), "the 100 zatoshis never showed: {b}");
+            std::thread::sleep(Duration::from_secs(2));
+        };
+        let row = b["transparentAddresses"].as_array().unwrap().iter().find(|r| r["address"] == to.as_str()).cloned();
+        println!("after dust: {}", row.clone().unwrap_or_default());
+        assert_eq!(row.map(|r| (r["uneconomic"].clone(), r["total"].clone())), Some((json!(100), json!(0))));
     }
 
     // Shield the transparent coinbase: one transaction per address, nothing linked.
