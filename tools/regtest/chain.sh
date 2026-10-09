@@ -12,21 +12,33 @@ C="${CHAIN_DIR:-$PWD/chain}"; mkdir -p "$C"
 ZEBRAD="${ZEBRAD:?set ZEBRAD to a zebrad binary}"; LWD="${LIGHTWALLETD:?set LIGHTWALLETD to a lightwalletd binary}"
 RPC_PORT="${RPC_PORT:-28232}"; P2P_PORT="${P2P_PORT:-28233}"; RPC="127.0.0.1:$RPC_PORT"
 LWD_PORTS=(29061 29063)
-NU6_3=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nu6_3"])' "$HERE/regtest.json")
+# sed reads the two numbers taken from JSON, so the script needs only curl and perl.
+json_num() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p"; }
+NU6_3=$(json_num nu6_3 < "$HERE/regtest.json")
 # Own session, so stopping whatever started the chain does not take it down. perl execs the
-# daemon, so `$!` is the daemon's own PID.
-DETACH=(perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' --)
+# daemon, so `$!` is the daemon's own PID. Git Bash on Windows has no sessions to leave; it
+# runs native daemons, whose Windows PIDs taskkill needs, and they read Windows paths.
+case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) WIN=1 ;; *) WIN= ;; esac
+if [ -n "$WIN" ]; then DETACH=(); STATE="$(cygpath -m "$C/state")"
+else DETACH=(perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' --); STATE="$C/state"; fi
 rpc() { curl -s --max-time 300 -H 'content-type: application/json' --data-binary "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" "http://$RPC/"; }
-height() { rpc getblockcount | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"])'; }
+height() { rpc getblockcount | json_num result; }
 mine_to() { while [ "$(height)" -lt "$1" ]; do n=$(( $1 - $(height) )); [ $n -gt 20 ] && n=20; rpc generate "[$n]" > /dev/null; done; }
 # Kills by PID and waits for the exit, so a restart never talks to the old process.
 stop_pid() {
   [ -f "$C/$1.pid" ] || return 0
   local pid; pid=$(cat "$C/$1.pid")
-  kill "$pid" 2>/dev/null
+  if [ -n "$WIN" ]; then
+    # Git Bash's kill does not reach a native process; taskkill does, by its Windows PID.
+    taskkill //F //T //PID "$(cat "$C/$1.winpid" 2>/dev/null || cat "/proc/$pid/winpid")" > /dev/null 2>&1
+  else
+    kill "$pid" 2>/dev/null
+  fi
   while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
-  rm -f "$C/$1.pid"
+  rm -f "$C/$1.pid" "$C/$1.winpid"
 }
+# The Windows PID of a daemon Git Bash started, once it runs the daemon itself.
+note_winpid() { [ -z "$WIN" ] || cat "/proc/$(cat "$C/$1.pid")/winpid" > "$C/$1.winpid" 2>/dev/null; }
 case "${1:-}" in
 start)
   # Without an address the config below would be empty, and zebrad would start on mainnet.
@@ -51,7 +63,7 @@ NU6 = 1
 listen_addr = "$RPC"
 enable_cookie_auth = false
 [state]
-cache_dir = "$C/state"
+cache_dir = "$STATE"
 [tracing]
 use_color = false
 TOML
@@ -61,6 +73,8 @@ TOML
     kill -0 "$(cat "$C/zebrad.pid")" 2>/dev/null || { echo "zebrad exited; see $C/zebrad.log"; exit 1; }
     sleep 1
   done
+  # Answering RPC, the wrapper has exec'd the node, so this is the node's Windows PID.
+  note_winpid zebrad
   "$0" lwd
   echo "height $(height)";;
 lwd)
@@ -71,6 +85,7 @@ lwd)
         --http-bind-addr "127.0.0.1:$(( ${LWD_PORTS[$i]} + 10 ))" --rpchost 127.0.0.1 --rpcport "$RPC_PORT" \
         --rpcuser x --rpcpassword x --data-dir "$C/lwd$i" --log-file "$C/lwd$i.log" < /dev/null >> "$C/lwd$i.out" 2>&1 &
       echo $! > "$C/lwd$i.pid"
+      note_winpid "lwd$i"
     fi
   done
   echo "lightwalletd: http://127.0.0.1:${LWD_PORTS[0]},http://127.0.0.1:${LWD_PORTS[1]}";;
