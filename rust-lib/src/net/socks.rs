@@ -1,8 +1,10 @@
 //! A socks5h connector for tonic: names resolve at the proxy, and the SOCKS
 //! credentials choose the Tor circuit (IsolateSOCKSAuth).
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use http::Uri;
@@ -19,16 +21,27 @@ pub const SCHEME: &str = "socks5h://";
 pub struct ProxyAddr {
     pub host: String,
     pub port: u16,
+    /// Servers that go around the proxy: the user chose to reach them without Tor.
+    pub bypass: Arc<BTreeSet<String>>,
 }
 
 impl ProxyAddr {
-    /// No proxy: a loopback lightwalletd on a regtest chain. Nothing else may use it.
+    /// No proxy: nothing on the routes goes through Tor.
     pub fn direct() -> Self {
-        Self { host: "direct".into(), port: 0 }
+        Self { host: "direct".into(), port: 0, bypass: Arc::default() }
     }
 
     pub fn is_direct(&self) -> bool {
         self.host == "direct" && self.port == 0
+    }
+
+    pub fn bypassing(mut self, servers: impl IntoIterator<Item = String>) -> Self {
+        self.bypass = Arc::new(servers.into_iter().collect());
+        self
+    }
+
+    pub fn bypasses(&self, server: &str) -> bool {
+        self.bypass.contains(server)
     }
 
     pub fn parse(url: &str) -> Result<Self, String> {
@@ -43,7 +56,7 @@ impl ProxyAddr {
         if host.is_empty() {
             return Err("proxy needs a host".into());
         }
-        Ok(Self { host: host.trim_matches(['[', ']']).to_string(), port })
+        Ok(Self { host: host.trim_matches(['[', ']']).to_string(), port, bypass: Arc::default() })
     }
 }
 
@@ -117,7 +130,7 @@ mod tests {
     fn proxy_urls() {
         assert_eq!(
             ProxyAddr::parse("socks5h://127.0.0.1:9050").unwrap(),
-            ProxyAddr { host: "127.0.0.1".into(), port: 9050 }
+            ProxyAddr { host: "127.0.0.1".into(), port: 9050, bypass: Arc::default() }
         );
         assert!(ProxyAddr::parse("socks5://127.0.0.1:9050").is_err());
         assert!(ProxyAddr::parse("http://127.0.0.1:8118").is_err());
