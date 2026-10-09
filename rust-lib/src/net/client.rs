@@ -1,5 +1,6 @@
 //! gRPC clients for lightwalletd-protocol servers, one Tor circuit per isolation.
 
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use http::Uri;
@@ -31,6 +32,8 @@ pub enum NetError {
     Status { server: String, status: tonic::Status },
     #[error("the local node is not available")]
     NoLocalNode,
+    #[error("{0} does not resolve to an address on your network")]
+    NotLan(String),
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -47,9 +50,36 @@ pub fn is_onion_url(server: &str) -> bool {
     server.parse::<Uri>().is_ok_and(|u| u.scheme_str() == Some("http") && u.host().is_some_and(is_onion))
 }
 
+/// An address on the user's own network, which Tor cannot reach: loopback, the private
+/// IPv4 ranges, CGNAT's 100.64/10 (Tailscale), link-local, and IPv6 unique-local.
+pub fn is_lan_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, ..] = ip.octets();
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || (a == 100 && (64..128).contains(&b))
+        }
+        IpAddr::V6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// A LAN address, or a name only the user's network resolves: mDNS `.local`, and the `.lan`,
+/// `.home.arpa` and `.internal` names home routers hand out.
+pub fn is_lan_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
+    match host.parse::<IpAddr>() {
+        Ok(ip) => is_lan_ip(ip),
+        Err(_) => host == "localhost" || [".local", ".lan", ".home.arpa", ".internal"].iter().any(|s| host.len() > s.len() && host.ends_with(s)),
+    }
+}
+
+/// A server on the user's own network, reached directly: Tor cannot reach it.
+pub fn is_lan_url(server: &str) -> bool {
+    server.parse::<Uri>().is_ok_and(|u| matches!(u.scheme_str(), Some("http" | "https")) && u.host().is_some_and(is_lan_host))
+}
+
 /// Opens a TLS channel to `server` (https://host:port), or a plain one to an onion service,
-/// through the proxy, on the circuit `isolation` selects; or, for `logos://zebrad_module`,
-/// the local node over IPC.
+/// through the proxy, on the circuit `isolation` selects. A server on the user's own network, or
+/// one the proxy bypasses, is dialled directly; `logos://zebrad_module` is the local node over IPC.
 pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> Result<Client, NetError> {
     if server == LOCAL_NODE_URL {
         let call = local_node().ok_or(NetError::NoLocalNode)?;
@@ -57,21 +87,35 @@ pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> R
         return Ok(CompactTxStreamerClient::new(channel).max_decoding_message_size(16 * 1024 * 1024));
     }
     let uri: Uri = server.parse().map_err(|_| NetError::BadUrl(server.into()))?;
-    if proxy.is_direct() {
-        // Regtest only: plaintext to a loopback lightwalletd, never anywhere else.
-        let loopback = matches!(uri.host(), Some("127.0.0.1" | "localhost" | "[::1]" | "::1"));
-        if uri.scheme_str() != Some("http") || !loopback {
-            return Err(NetError::BadUrl(server.into()));
+    if is_lan_url(server) {
+        let host = uri.host().unwrap_or_default().trim_start_matches('[').trim_end_matches(']').to_string();
+        // A name must resolve onto the user's network, or this connection would bypass Tor.
+        if host.parse::<IpAddr>().is_err() {
+            let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") { 443 } else { 80 });
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port)).await.map(Iterator::collect).unwrap_or_default();
+            if addrs.is_empty() || !addrs.iter().all(|a| is_lan_ip(a.ip())) {
+                return Err(NetError::NotLan(server.into()));
+            }
         }
-        let channel = Endpoint::from_shared(server.to_string())
-            .map_err(|source| NetError::Connect { server: server.into(), source })?
-            .connect()
-            .await
-            .map_err(|source| NetError::Connect { server: server.into(), source })?;
-        return Ok(client(channel));
+        let wrap = |source| NetError::Connect { server: server.into(), source };
+        let endpoint = Endpoint::from_shared(server.to_string()).map_err(wrap)?.connect_timeout(CONNECT_TIMEOUT);
+        let endpoint = match uri.scheme_str() {
+            Some("https") => endpoint.tls_config(ClientTlsConfig::new().with_webpki_roots().domain_name(host)).map_err(wrap)?,
+            _ => endpoint,
+        };
+        return Ok(client(endpoint.connect().await.map_err(wrap)?));
     }
     let host = uri.host().ok_or_else(|| NetError::BadUrl(server.into()))?.to_string();
     let wrap = |source| NetError::Connect { server: server.into(), source };
+    if proxy.is_direct() || proxy.bypasses(server) {
+        // Without Tor only https: an onion service needs it, and plain http would be readable.
+        if uri.scheme_str() != Some("https") {
+            return Err(NetError::BadUrl(server.into()));
+        }
+        let endpoint = Endpoint::from_shared(server.to_string()).map_err(wrap)?.connect_timeout(CONNECT_TIMEOUT);
+        let endpoint = endpoint.tls_config(ClientTlsConfig::new().with_webpki_roots().domain_name(host)).map_err(wrap)?;
+        return Ok(client(endpoint.connect().await.map_err(wrap)?));
+    }
     let endpoint = Endpoint::from_shared(server.to_string()).map_err(wrap)?.connect_timeout(CONNECT_TIMEOUT);
     let endpoint = match uri.scheme_str() {
         Some("https") => endpoint
@@ -91,6 +135,30 @@ pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> R
 mod tests {
     use super::*;
     use zcash_client_backend::proto::service::Empty;
+
+    #[test]
+    fn lan_addresses() {
+        for host in ["127.0.0.1", "10.0.0.5", "172.16.3.4", "172.31.255.1", "192.168.1.10", "100.64.0.1", "100.127.1.1", "169.254.1.1", "[::1]", "[fd12:3456::1]", "[fe80::1]"] {
+            assert!(is_lan_host(host), "{host}");
+        }
+        for host in ["localhost", "nas.local", "framework.lan", "Node.LAN.", "box.home.arpa", "zebra.internal"] {
+            assert!(is_lan_host(host), "{host}");
+        }
+        for host in ["8.8.8.8", "172.32.0.1", "100.128.0.1", "193.168.1.1", "[2001:db8::1]", "zec.rocks", "lan", ".local", "local.example.com", "planet"] {
+            assert!(!is_lan_host(host), "{host}");
+        }
+        assert!(is_lan_url("http://192.168.1.10:9067"));
+        assert!(is_lan_url("https://[fd00::2]:9067"));
+        assert!(is_lan_url("http://framework.lan:9067"));
+        assert!(!is_lan_url("http://zec.rocks:9067"));
+        assert!(!is_lan_url("socks5h://192.168.1.10:9050"));
+    }
+
+    #[tokio::test]
+    async fn a_lan_name_must_resolve_onto_the_lan() {
+        let server = "http://this-name-does-not-exist.home.arpa:9067";
+        assert!(matches!(connect(server, &ProxyAddr::direct(), Isolation::fresh()).await, Err(NetError::NotLan(_))));
+    }
 
     /// Needs a Tor SOCKS port in ZCASH_TEST_TOR, e.g. socks5h://127.0.0.1:19050.
     #[tokio::test]
@@ -138,5 +206,8 @@ mod tests {
     async fn an_onion_needs_tor() {
         let server = format!("http://{}.onion:9067", "a2".repeat(28));
         assert!(matches!(connect(&server, &ProxyAddr::direct(), Isolation::fresh()).await, Err(NetError::BadUrl(_))));
+        // Even when the proxy is told to go around it.
+        let tor = ProxyAddr::parse("socks5h://127.0.0.1:9").unwrap().bypassing([server.clone()]);
+        assert!(matches!(connect(&server, &tor, Isolation::fresh()).await, Err(NetError::BadUrl(_))));
     }
 }

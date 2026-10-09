@@ -47,35 +47,40 @@ pub struct Routes {
     /// node still broadcasts through servers over Tor. Empty means nowhere: sends are refused.
     #[serde(default)]
     pub broadcast: Option<Vec<String>>,
+    /// Servers the user chose to reach without Tor. Each must be https.
+    #[serde(default)]
+    pub direct: Vec<String>,
 }
 
 impl Routes {
     fn config(&self) -> Result<SyncConfig, String> {
+        use crate::net::client::{is_lan_url, is_onion_url};
         if self.servers.is_empty() {
             return Err("no servers".into());
         }
         let broadcast = self.broadcast.clone().unwrap_or_else(|| self.servers.clone());
         let remote: Vec<&String> = self.servers.iter().chain(&broadcast).filter(|s| *s != LOCAL_NODE_URL).collect();
-        let mut cfg = if remote.is_empty() {
-            // Only the local node, over IPC: no proxy is involved.
-            SyncConfig::new(ProxyAddr::direct(), self.servers.clone())
-        } else if self.proxy == "direct" {
-            // A regtest chain may use a loopback lightwalletd without Tor or TLS.
-            if !crate::network::regtest_configured() || remote.iter().any(|s| !s.starts_with("http://127.0.0.1:")) {
-                return Err("a direct connection is only for a loopback regtest server".into());
-            }
-            let mut cfg = SyncConfig::new(ProxyAddr::direct(), self.servers.clone());
-            cfg.tip_poll = Duration::from_secs(2);
-            cfg
-        } else {
-            if remote.iter().any(|s| !s.starts_with("https://") && !crate::net::client::is_onion_url(s)) {
-                return Err("servers must be https:// URLs, or http:// onion services".into());
-            }
-            SyncConfig::new(ProxyAddr::parse(&self.proxy)?, self.servers.clone())
+        if let Some(bad) = remote.iter().find(|s| !(is_lan_url(s) || s.starts_with("https://") || is_onion_url(s))) {
+            return Err(format!("{bad}: servers must be https:// URLs, http:// onion services, or on your own network"));
+        }
+        if let Some(bad) = self.direct.iter().find(|s| is_onion_url(s)) {
+            return Err(format!("{bad}: an onion service is reached through Tor only"));
+        }
+        // Tor cannot reach the user's own network, and the user may have a server skip it.
+        let through_tor = remote.iter().find(|s| !is_lan_url(s) && !self.direct.contains(s));
+        let proxy = match through_tor {
+            None => ProxyAddr::direct(),
+            Some(s) => ProxyAddr::parse(&self.proxy).map_err(|e| format!("{s} goes through Tor: {e}"))?,
         };
-        // The local node answers in memory; polling it often costs nothing.
-        if self.servers[0] == LOCAL_NODE_URL {
+        let mut cfg = SyncConfig::new(proxy.bypassing(self.direct.iter().cloned()), self.servers.clone());
+        // Tips come from the first server. The local node answers in memory and a LAN server is
+        // close, so polling them often costs nothing.
+        if self.servers[0] == LOCAL_NODE_URL || is_lan_url(&self.servers[0]) {
             cfg.tip_poll = cfg.tip_poll.min(Duration::from_secs(5));
+        }
+        // A regtest chain on loopback mines on demand.
+        if !remote.is_empty() && remote.iter().all(|s| s.starts_with("http://127.0.0.1:")) {
+            cfg.tip_poll = Duration::from_secs(2);
         }
         cfg.broadcast = broadcast;
         Ok(cfg)
@@ -982,6 +987,7 @@ mod tests {
             proxy: proxy.into(),
             servers: servers.iter().map(|s| s.to_string()).collect(),
             broadcast: (!broadcast.is_empty()).then(|| broadcast.iter().map(|s| s.to_string()).collect()),
+            direct: vec![],
         }
     }
 
@@ -1003,6 +1009,26 @@ mod tests {
         assert!(routes(tor, &[onion.as_str()], &[]).config().is_ok());
         assert!(routes("", &[onion.as_str()], &[]).config().is_err());
         assert!(routes(tor, &["logos://other_module"], &[]).config().is_err());
+        // A server on the user's own network is reached directly, without a proxy.
+        let lan = "http://192.168.1.10:9067";
+        let cfg = routes("", &[lan], &[]).config().unwrap();
+        assert!(cfg.proxy.is_direct() && cfg.tip_poll <= Duration::from_secs(5));
+        assert!(!routes(tor, &[lan, "https://zec.rocks:443"], &[]).config().unwrap().proxy.is_direct());
+        // A server the user chose to reach without Tor goes around the proxy; the others do not.
+        let (rocks, na) = ("https://zec.rocks:443", "https://na.zec.rocks:443");
+        let mut r = routes(tor, &[rocks, na], &[]);
+        r.direct = vec![rocks.into()];
+        let cfg = r.config().unwrap();
+        assert!(!cfg.proxy.is_direct() && cfg.proxy.bypasses(rocks) && !cfg.proxy.bypasses(na));
+        // With every server direct, no proxy is needed.
+        let mut r = routes("", &[rocks], &[]);
+        r.direct = vec![rocks.into()];
+        assert!(r.config().unwrap().proxy.is_direct());
+        // An onion service is reached through Tor only, and "direct" is no proxy at all.
+        let mut r = routes(tor, &[onion.as_str()], &[]);
+        r.direct = vec![onion.clone()];
+        assert!(r.config().is_err());
+        assert!(routes("direct", &[rocks], &[]).config().is_err());
         // An empty broadcast list syncs but leaves nothing to send through.
         let mut r = routes(tor, &[LOCAL_NODE_URL], &[]);
         r.broadcast = Some(vec![]);

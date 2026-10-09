@@ -16,7 +16,14 @@ which holds the roles; this module holds the keys.
   (`rusqlite` `bundled-sqlcipher`: CommonCrypto on Apple, vendored OpenSSL elsewhere),
   opened through `WalletDb::from_connection`.
 - **Sync over Tor.** Every call goes through a `socks5h://` proxy; SOCKS credentials pick
-  the circuit. Compact blocks download in 1,000-block chunks from the tip down, one circuit
+  the circuit. Two exceptions, both reached directly:
+  - servers on the user's own network, which Tor cannot reach: private, loopback, CGNAT and
+    link-local addresses, or `.local`, `.lan`, `.home.arpa` and `.internal` names that resolve
+    only to such addresses;
+  - an https server the user chose to reach without Tor (the routes' `direct` list). An onion
+    service is always reached through Tor.
+
+  Compact blocks download in 1,000-block chunks from the tip down, one circuit
   per chunk, so the request order says nothing about where the wallet's notes are. Tree
   states are fetched only at chunk boundaries; a scan that starts mid-chunk advances the
   boundary state through cached blocks (`sync::frontier`). Each chunk must continue the tree
@@ -49,7 +56,9 @@ Every structured value is a JSON string: `{ "ok": true, ... }` or `{ "ok": false
 Events: `wallet_state_changed`, `sync_progress`, `balance_changed`, `job_finished`.
 
 Job parameters carry the route table the backend got from `zcash_node_module`:
-`{ "routes": { "proxy": "socks5h://127.0.0.1:9050", "servers": ["https://..."] } }`.
+`{ "routes": { "proxy": "socks5h://127.0.0.1:9050", "servers": ["https://..."], "direct": ["https://..."] } }`.
+`direct`, optional, lists the servers to reach without Tor. When nothing goes through Tor, the
+proxy may be `"direct"`, which means none.
 
 ## Development
 
@@ -76,8 +85,8 @@ persistence directory can admit more: `{ "modules": [...], "allowHost": true }`.
 `tools/regtest/chain.sh` runs a local chain: zebrad 7.0.0-rc.0 or later (regtest disables
 proof of work, so its `generate` RPC mines on demand) and two lightwalletd on loopback.
 `prepare` mines Orchard coinbase before NU6.3, then transparent coinbase, then Ironwood
-coinbase, and matures it all. The wallet joins with proxy `"direct"`, which only a regtest
-wallet accepts, and only for `http://127.0.0.1:` servers. A module instance runs regtest when
+coinbase, and matures it all. The wallet reaches its `http://127.0.0.1:` servers directly, as
+it does any server on the user's own network. A module instance runs regtest when
 its persistence directory holds `regtest.json`.
 
 logos-zebra-nix builds both processes: `regtest-zebrad` runs zebrad's command line on
