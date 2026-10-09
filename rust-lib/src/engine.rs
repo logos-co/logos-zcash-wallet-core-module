@@ -204,6 +204,24 @@ enum WalletCmd {
     Sign(String, Phrase, Arc<zcash_proofs::prover::LocalTxProver>, Sender<Result<(Vec<(String, Vec<u8>)>, bool), String>>),
 }
 
+impl WalletCmd {
+    /// Picks shielded notes, which no pool offers while a block the wallet knows of is unscanned.
+    fn selects_notes(&self) -> bool {
+        matches!(self, WalletCmd::Propose(..) | WalletCmd::ProposeMigrateNow(..) | WalletCmd::PlanMigration(..))
+    }
+}
+
+/// How long a proposal waits for the wallet to scan the blocks it already knows of.
+const SCAN_WAIT: Duration = Duration::from_secs(30);
+
+/// A block past the last fully scanned one is known: until it is scanned, nothing is spendable.
+fn behind_tip(db: &Db) -> bool {
+    match (db.chain_height(), db.block_fully_scanned()) {
+        (Ok(Some(tip)), Ok(Some(done))) => done.block_height() < tip,
+        _ => false,
+    }
+}
+
 struct OpenWallet {
     meta: Meta,
     network: ZNetwork,
@@ -806,9 +824,19 @@ fn wallet_loop(
     let params = *db.params();
     // A regtest chain is mined on demand, so its migration is driven faster.
     let drive_every = Duration::from_secs(if params == ZNetwork::Regtest { 3 } else { 30 });
+    let mut waiting: Vec<(Instant, WalletCmd)> = vec![];
     while !stop.load(Ordering::SeqCst) {
         prepared.retain(|_, p| p.created.elapsed().as_secs() <= crate::send::PREVIEW_TTL_SECS);
-        while let Ok(cmd) = cmd_rx.try_recv() {
+        // A new block makes every pool report nothing to spend until it is scanned, so a
+        // proposal waits for that scan, up to SCAN_WAIT, rather than fail on the timing.
+        let mut cmds = std::mem::take(&mut waiting);
+        cmds.extend(std::iter::from_fn(|| cmd_rx.try_recv().ok()).map(|c| (Instant::now(), c)));
+        let behind = cmds.iter().any(|(_, c)| c.selects_notes()) && behind_tip(&db);
+        for (since, cmd) in cmds {
+            if behind && cmd.selects_notes() && since.elapsed() < SCAN_WAIT {
+                waiting.push((since, cmd));
+                continue;
+            }
             match cmd {
                 WalletCmd::NewAddress(reply) => {
                     let r = db
