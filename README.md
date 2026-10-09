@@ -43,7 +43,7 @@ Every structured value is a JSON string: `{ "ok": true, ... }` or `{ "ok": false
 | `list_wallets(network)`, `wallet_status()`, `sync_status()` | Reads |
 | `balances(account)` | Per pool: spendable, pending change, pending spendability, total; transparent funds per address |
 | `addresses(account)`, `new_address(account)` | The shielded-only Unified Address and the current transparent address |
-| `history(account, page)` | Newest first, with kind, pools, memos and the amount that crossed pools |
+| `history(account, page)` | Newest first, with kind, pools, memos and the amount that crossed pools. Each row also says what the transaction was for: payments to others (`to`) and to the wallet's own addresses (`toSelf`), or for a shielding, the amount shielded and the transparent addresses it spent (`from`) |
 | `reveal_seed(password)`, `export_viewing_key(account, password)` | Once, after checking the password |
 
 Events: `wallet_state_changed`, `sync_progress`, `balance_changed`, `job_finished`.

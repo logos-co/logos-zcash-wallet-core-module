@@ -104,6 +104,13 @@ impl Chain {
     }
 }
 
+/// The history row of the first transaction `sent` broadcast.
+fn history_row(c: &Chain, sent: &Value) -> Value {
+    let history = c.engine.history(0);
+    let rows = history["rows"].as_array().unwrap_or_else(|| panic!("history: {history}"));
+    rows.iter().find(|r| r["txid"] == sent["transactions"][0]["txid"]).cloned().unwrap_or_default()
+}
+
 fn total(b: &Value, pool: &str) -> u64 {
     b["pools"][pool]["total"].as_u64().unwrap()
 }
@@ -229,7 +236,8 @@ fn send_shield_and_migrate_on_regtest() {
             .find(|r| r["txid"] == sent["transactions"][0]["txid"])
             .cloned();
         println!("history row {}", row.clone().unwrap_or_default());
-        assert_eq!(row.map(|r| r["kind"].clone()), Some(json!("sent")));
+        let row = row.unwrap_or_default();
+        assert_eq!((&row["kind"], &row["sentToOthers"], &row["sentToSelf"]), (&json!("sent"), &json!(amount), &json!(0)), "{row}");
     }
 
     // 100 zatoshis to its own transparent address, less than spending them would cost: the
@@ -253,6 +261,11 @@ fn send_shield_and_migrate_on_regtest() {
         let row = b["transparentAddresses"].as_array().unwrap().iter().find(|r| r["address"] == to.as_str()).cloned();
         println!("after dust: {}", row.clone().unwrap_or_default());
         assert_eq!(row.map(|r| (r["uneconomic"].clone(), r["total"].clone())), Some((json!(100), json!(0))));
+        // History keeps what the send was for: 100 zatoshis to itself, not just the fee.
+        let row = history_row(&c, &sent);
+        println!("dust history row {row}");
+        assert_eq!((&row["kind"], &row["sentToSelf"], &row["sentToOthers"]), (&json!("sent"), &json!(100), &json!(0)), "{row}");
+        assert_eq!(row["toSelf"][0]["address"], to.as_str());
     }
 
     // Shield the transparent coinbase: one transaction per address, nothing linked.
@@ -274,6 +287,12 @@ fn send_shield_and_migrate_on_regtest() {
             total(&b, "transparent")
         );
         assert!(total(&b, "transparent") < t_before);
+        let row = history_row(&c, &sent);
+        println!("shield history row {row}");
+        assert_eq!(row["kind"], "shielded", "{row}");
+        let from: u64 = row["from"].as_array().unwrap().iter().map(|f| f["amount"].as_u64().unwrap()).sum();
+        let fee = row["fee"].as_u64().unwrap();
+        assert_eq!(row["shielded"].as_u64().unwrap(), from - fee, "what it shielded is what it spent, less the fee: {row}");
     }
 
     // The ZIP 318 run: plan, review, sign once, then the wallet drives it as blocks arrive.

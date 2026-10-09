@@ -62,8 +62,18 @@ pub fn page(conn: &Connection, network: ZNetwork, account: AccountUuid, page: u3
     let mut outputs = conn
         .prepare_cached(
             "SELECT output_pool, value, is_change, memo, to_address,
-                    from_account_uuid = ?2 AND (to_account_uuid IS NULL OR to_account_uuid != ?2)
+                    from_account_uuid = ?2 AND (to_account_uuid IS NULL OR to_account_uuid != ?2),
+                    from_account_uuid = ?2 AND to_account_uuid = ?2
              FROM v_tx_outputs WHERE txid = ?1 ORDER BY output_pool, output_index",
+        )
+        .map_err(|e| e.to_string())?;
+    // The transparent coins a transaction spent, per address: where a shielding came from.
+    let mut spent = conn
+        .prepare_cached(
+            "SELECT o.address, SUM(o.value_zat), COUNT(*) FROM transparent_received_output_spends s
+             JOIN transparent_received_outputs o ON o.id = s.transparent_received_output_id
+             JOIN transactions t ON t.id_tx = s.transaction_id
+             WHERE t.txid = ?1 GROUP BY o.address ORDER BY o.address",
         )
         .map_err(|e| e.to_string())?;
     for row in rows {
@@ -72,13 +82,24 @@ pub fn page(conn: &Connection, network: ZNetwork, account: AccountUuid, page: u3
         let mut pools = std::collections::BTreeSet::new();
         let mut memos = vec![];
         let mut to = vec![];
+        // What the wallet paid itself: a payment to one of its own addresses, unlike change.
+        let mut to_self = vec![];
+        let mut kept = 0i64;
         let outs = outputs
             .query_map(params![&txid, uuid], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?, r.get::<_, Option<Vec<u8>>>(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, Option<bool>>(5)?.unwrap_or(false)))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, Option<Vec<u8>>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<bool>>(5)?.unwrap_or(false),
+                    r.get::<_, Option<bool>>(6)?.unwrap_or(false),
+                ))
             })
             .map_err(|e| e.to_string())?;
         for o in outs {
-            let (p, value, change, memo, addr, sent_row) = o.map_err(|e| e.to_string())?;
+            let (p, value, change, memo, addr, sent_row, self_row) = o.map_err(|e| e.to_string())?;
             pools.insert(pool(p));
             if let Some(m) = memo_text(memo) {
                 memos.push(m);
@@ -86,7 +107,14 @@ pub fn page(conn: &Connection, network: ZNetwork, account: AccountUuid, page: u3
             if sent_row && !change {
                 to.push(json!({"address": addr, "pool": pool(p), "amount": value}));
             }
+            if self_row {
+                kept += value;
+                if !change {
+                    to_self.push(json!({"address": addr, "pool": pool(p), "amount": value}));
+                }
+            }
         }
+        let sum = |v: &[Value]| v.iter().map(|o| o["amount"].as_i64().unwrap_or(0)).sum::<i64>();
         // zip318_kind is an integer code; 0 means not classified yet, never "not a migration".
         let migration = matches!(zip318.map(Zip318Classification::from_code), Some(Zip318Classification::Conforms(_)));
         let kind = if migration {
@@ -97,6 +125,17 @@ pub fn page(conn: &Connection, network: ZNetwork, account: AccountUuid, page: u3
             "sent"
         } else {
             "received"
+        };
+        let from: Vec<Value> = if kind == "shielded" {
+            spent
+                .query_map(params![&txid], |r| {
+                    Ok(json!({"address": r.get::<_, String>(0)?, "amount": r.get::<_, i64>(1)?, "coins": r.get::<_, i64>(2)?}))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?
+        } else {
+            vec![]
         };
         // txids display in reverse byte order.
         let mut display = txid.clone();
@@ -113,7 +152,13 @@ pub fn page(conn: &Connection, network: ZNetwork, account: AccountUuid, page: u3
             "fee": fee,
             "pools": pools,
             "memos": memos,
+            "sentToOthers": sum(&to),
+            "sentToSelf": sum(&to_self),
+            // What a shielding moved into the shielded pools, and the transparent coins it spent.
+            "shielded": if kind == "shielded" { kept } else { 0 },
+            "from": from,
             "to": to,
+            "toSelf": to_self,
             "receivedNotes": received,
             "amountMadePublic": crossing.unwrap_or(0),
         }));
