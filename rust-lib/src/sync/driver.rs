@@ -11,7 +11,10 @@ use serde::Serialize;
 use zcash_client_backend::data_api::chain::{error::Error as ChainError, scan_cached_blocks, ChainState, CommitmentTreeRoot};
 use zcash_client_backend::data_api::scanning::ScanPriority;
 use zcash_client_backend::data_api::wallet::decrypt_and_store_transaction;
-use zcash_client_backend::data_api::{TransactionDataRequest, WalletCommitmentTrees, WalletRead, WalletWrite};
+use zcash_client_backend::data_api::{
+    TransactionDataRequest, WalletCommitmentTrees, WalletRead, WalletWrite, IRONWOOD_SHARD_HEIGHT, ORCHARD_SHARD_HEIGHT,
+    SAPLING_SHARD_HEIGHT,
+};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::{GetSubtreeRootsArg, LightdInfo, ShieldedProtocol};
 use zcash_keys::encoding::AddressCodec;
@@ -180,7 +183,10 @@ pub struct Syncer {
     tip_in_flight: bool,
     last_tip_poll: Option<Instant>,
     tip: Option<u32>,
-    roots_loaded: bool,
+    /// Subtree roots stored this session per pool (Sapling, Orchard, Ironwood), and the shards
+    /// a window last needed when they were fetched.
+    roots: Option<[u64; 3]>,
+    roots_asked: [u64; 3],
     next_server: usize,
     /// The chain state after the last scan call, to continue mid-chunk cheaply.
     last_end: Option<ChainState>,
@@ -230,7 +236,8 @@ impl Syncer {
             tip_in_flight: false,
             last_tip_poll: None,
             tip: None,
-            roots_loaded: false,
+            roots: None,
+            roots_asked: [0; 3],
             next_server: 0,
             last_end: None,
             enh_in_flight: HashSet::new(),
@@ -289,9 +296,8 @@ impl Syncer {
             return Ok(Step::Waiting);
         };
         self.cross_check_if_due();
-        if !self.roots_loaded {
-            self.load_subtree_roots(db)?;
-            self.roots_loaded = true;
+        if self.roots.is_none() {
+            self.roots = Some(self.load_subtree_roots(db, [0; 3])?);
         }
         self.plan_downloads(db, tip)?;
         let worked = self.scan_once(db, tip)?;
@@ -492,13 +498,14 @@ impl Syncer {
         Ok(())
     }
 
-    fn load_subtree_roots(&mut self, db: &mut Db) -> Result<(), SyncError> {
+    /// Loads the subtree roots completed since `from`, per pool, and returns how many each now has.
+    fn load_subtree_roots(&mut self, db: &mut Db, from: [u64; 3]) -> Result<[u64; 3], SyncError> {
         let (server, proxy) = (self.cfg.servers[0].clone(), self.cfg.proxy.clone());
-        let fetch = |p: ShieldedProtocol| {
+        let fetch = |p: ShieldedProtocol, start: u64| {
             let (server, proxy) = (server.clone(), proxy.clone());
             async move {
                 let mut c = connect(&server, &proxy, Isolation::fresh()).await?;
-                let arg = GetSubtreeRootsArg { start_index: 0, shielded_protocol: p as i32, max_entries: 0 };
+                let arg = GetSubtreeRootsArg { start_index: start as u32, shielded_protocol: p as i32, max_entries: 0 };
                 let roots: Vec<_> = c
                     .get_subtree_roots(arg)
                     .await
@@ -520,12 +527,28 @@ impl Syncer {
                 .collect()
         }
         let bad = |d: String| SyncError::Misbehaving { server: server.clone(), detail: d };
-        let sapling = parse::<sapling::Node>(self.rt.block_on(fetch(ShieldedProtocol::Sapling))?).map_err(bad)?;
-        let orchard = parse::<orchard::tree::MerkleHashOrchard>(self.rt.block_on(fetch(ShieldedProtocol::Orchard))?).map_err(bad)?;
-        let ironwood = parse::<orchard::tree::MerkleHashOrchard>(self.rt.block_on(fetch(ShieldedProtocol::Ironwood))?).map_err(bad)?;
-        db.put_sapling_subtree_roots(0, &sapling).map_err(db_err)?;
-        db.put_orchard_subtree_roots(0, &orchard).map_err(db_err)?;
-        db.put_ironwood_subtree_roots(0, &ironwood).map_err(db_err)?;
+        let [s, o, i] = from;
+        let sapling = parse::<sapling::Node>(self.rt.block_on(fetch(ShieldedProtocol::Sapling, s))?).map_err(bad)?;
+        let orchard = parse::<orchard::tree::MerkleHashOrchard>(self.rt.block_on(fetch(ShieldedProtocol::Orchard, o))?).map_err(bad)?;
+        let ironwood = parse::<orchard::tree::MerkleHashOrchard>(self.rt.block_on(fetch(ShieldedProtocol::Ironwood, i))?).map_err(bad)?;
+        db.put_sapling_subtree_roots(s, &sapling).map_err(db_err)?;
+        db.put_orchard_subtree_roots(o, &orchard).map_err(db_err)?;
+        db.put_ironwood_subtree_roots(i, &ironwood).map_err(db_err)?;
+        Ok([s + sapling.len() as u64, o + orchard.len() as u64, i + ironwood.len() as u64])
+    }
+
+    /// The wallet database refuses a gap between shards. A window that starts in a shard past
+    /// the roots loaded so far first loads those completed since, as when the chain grew during
+    /// the session (a local node syncing). Once per need: a source without them fails the scan.
+    fn ensure_roots(&mut self, db: &mut Db, state: &ChainState) -> Result<(), SyncError> {
+        let need = first_shards(state);
+        let have = self.roots.unwrap_or_default();
+        if !roots_missing(need, have, self.roots_asked) {
+            return Ok(());
+        }
+        // Recorded after the fetch, so a failed one is retried on the next step.
+        self.roots = Some(self.load_subtree_roots(db, have)?);
+        self.roots_asked = need;
         Ok(())
     }
 
@@ -740,6 +763,7 @@ impl Syncer {
                     let avail = self.cache.contiguous_end(ws)?.min(re).min(c + GRID);
                     if avail > ws {
                         if let Some(state) = self.state_before(ws)? {
+                            self.ensure_roots(db, &state)?;
                             self.scan_window(db, ws, avail, state)?;
                             self.prune_chunk(db, c, tip)?;
                             return Ok(true);
@@ -808,9 +832,43 @@ impl Syncer {
     }
 }
 
+/// Per pool, the shard the next note commitment after `state` falls in.
+fn first_shards(state: &ChainState) -> [u64; 3] {
+    [
+        state.final_sapling_tree().tree_size() >> SAPLING_SHARD_HEIGHT,
+        state.final_orchard_tree().tree_size() >> ORCHARD_SHARD_HEIGHT,
+        state.final_ironwood_tree().tree_size() >> IRONWOOD_SHARD_HEIGHT,
+    ]
+}
+
+/// Whether a window starting in shards `need` lacks roots: some pool needs a shard past the
+/// `have` roots stored, and past what was already asked for.
+fn roots_missing(need: [u64; 3], have: [u64; 3], asked: [u64; 3]) -> bool {
+    let past = |a: [u64; 3], b: [u64; 3]| a.iter().zip(b).any(|(x, y)| *x > y);
+    past(need, have) && past(need, asked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roots_are_loaded_only_past_a_gap() {
+        // Shard 0 of Ironwood loaded, a window in shard 2: shard 1's root is missing.
+        assert!(roots_missing([3, 2, 2], [3, 2, 1], [0; 3]));
+        // Adjacent to the roots, or inside them: no gap.
+        assert!(!roots_missing([3, 2, 1], [3, 2, 1], [0; 3]));
+        assert!(!roots_missing([0, 0, 0], [3, 2, 1], [0; 3]));
+        // Already asked for that need; only a later shard asks again.
+        assert!(!roots_missing([3, 2, 2], [3, 2, 1], [3, 2, 2]));
+        assert!(roots_missing([3, 2, 3], [3, 2, 1], [3, 2, 2]));
+    }
+
+    #[test]
+    fn the_first_shard_of_an_empty_tree_is_zero() {
+        let state = ChainState::empty(BlockHeight::from(1_000_000), zcash_primitives::block::BlockHash([0; 32]));
+        assert_eq!(first_shards(&state), [0, 0, 0]);
+    }
 
     #[test]
     fn an_error_stands_until_its_source_succeeds() {
