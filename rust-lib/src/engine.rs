@@ -679,6 +679,8 @@ fn pool_json(b: &zcash_client_backend::data_api::Balance) -> Value {
         "pendingChange": zat(b.change_pending_confirmation()),
         "pendingSpendability": zat(b.value_pending_spendability()),
         "total": zat(b.total()),
+        // Outputs too small to be worth spending, left out of every other figure.
+        "uneconomic": zat(b.uneconomic_value()),
     })
 }
 
@@ -719,8 +721,11 @@ fn transparent_funds<C: std::borrow::Borrow<rusqlite::Connection>>(db: &wallet::
         .map_err(|e| e.to_string())?;
     let mut rows: Vec<Value> = balances
         .into_iter()
-        .filter(|(_, (_, b))| b.total().into_u64() > 0)
-        .map(|(addr, (_, b))| json!({"address": addr.encode(db.params()), "spendable": zat(b.spendable_value()), "total": zat(b.total())}))
+        .filter(|(_, (_, b))| b.total().into_u64() > 0 || b.uneconomic_value().into_u64() > 0)
+        .map(|(addr, (_, b))| {
+            json!({"address": addr.encode(db.params()), "spendable": zat(b.spendable_value()), "total": zat(b.total()),
+                   "uneconomic": zat(b.uneconomic_value())})
+        })
         .collect();
     rows.sort_by(|a, b| a["address"].as_str().cmp(&b["address"].as_str()));
     Ok(json!(rows))
