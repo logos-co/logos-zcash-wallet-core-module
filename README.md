@@ -92,7 +92,9 @@ its persistence directory holds `regtest.json`.
 logos-zebra-nix builds both processes: `regtest-zebrad` runs zebrad's command line on
 libzebrad_c, and `lightwalletd` is v0.5.4. `nix build .#regtest-chain` packages the script
 with `regtest.json` (in `share/regtest/`) for harnesses outside this repository, such as
-the app's doctest.
+the app's doctest. The script also runs under Git Bash on Windows, against zebra-nix's
+Windows builds of both processes; `packages.x86_64-windows.regtest-chain` packages it for the
+doctest's Windows leg. There it stops each process with `taskkill`.
 
 ```bash
 cd rust-lib
