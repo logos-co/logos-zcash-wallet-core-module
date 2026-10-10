@@ -245,7 +245,8 @@ pub fn propose_migrate_now(db: &mut Db, params: ZNetwork, account: AccountUuid) 
 }
 
 /// Proposes from one shielded pool at a time, Ironwood first. Spending from several
-/// pools at once needs the caller's consent, because it reveals amounts.
+/// pools at once needs the caller's consent, because it reveals amounts; it is asked
+/// for only when the pools together can pay.
 pub fn propose(db: &mut Db, params: ZNetwork, account: AccountUuid, input: &SendInput) -> Result<WalletProposal, String> {
     let req = request(params, input)?;
     let selector = GreedyInputSelector::new();
@@ -260,14 +261,15 @@ pub fn propose(db: &mut Db, params: ZNetwork, account: AccountUuid, input: &Send
             Err(e) => last_err = e.to_string(),
         }
     }
-    if !input.allow_mixed_pools {
-        return Err(format!("needs_mixed_pools: no single pool can pay this ({last_err})"));
-    }
     let policy = SpendPolicy::shielded_pools([ShieldedPool::Ironwood, ShieldedPool::Sapling, ShieldedPool::Orchard]);
-    propose_transfer::<_, _, _, _, std::convert::Infallible>(
+    let mixed = propose_transfer::<_, _, _, _, std::convert::Infallible>(
         db, &params, account, &selector, &change, req, ConfirmationsPolicy::default(), &policy, None, None,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    match mixed {
+        Ok(_) if !input.allow_mixed_pools => Err(format!("needs_mixed_pools: no single pool can pay this ({last_err})")),
+        other => other,
+    }
 }
 
 /// What the approver reviews: recipients, fee, pools, and the amount made public.
