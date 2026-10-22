@@ -1,8 +1,8 @@
 # logos-zcash-wallet-core-module
 
 `zcash_wallet_core_module`: the Zcash wallet engine for Logos. A light client built on
-librustzcash's pre-release NU7 cohort (`zcash_client_backend` 0.25.0-pre.1,
-`zcash_client_sqlite` 0.23.0-pre.1), running as a Rust module inside its own `logos_host`.
+librustzcash's NU7 release (`zcash_client_backend` 0.25.0, `zcash_client_sqlite` 0.23.0),
+running as a Rust module inside its own `logos_host`.
 
 It answers only `zcash_wallet_backend`. Apps and the CLI reach it through the backend,
 which holds the roles; this module holds the keys.
