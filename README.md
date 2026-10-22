@@ -82,15 +82,17 @@ persistence directory can admit more: `{ "modules": [...], "allowHost": true }`.
 
 ## Regtest
 
-`tools/regtest/chain.sh` runs a local chain: zebrad 7.0.0-rc.0 or later (regtest disables
+`tools/regtest/chain.sh` runs a local chain: zebrad 7.0.0 or later (regtest disables
 proof of work, so its `generate` RPC mines on demand) and two lightwalletd on loopback.
 `prepare` mines Orchard coinbase before NU6.3, then transparent coinbase, then Ironwood
-coinbase, and matures it all. The wallet reaches its `http://127.0.0.1:` servers directly, as
+coinbase, and matures it all. NU7 activates at 200, so the wallet works past it, as on
+testnet and soon mainnet: sends expire 120 blocks out, and the migration's delays scale by
+three. The wallet reaches its `http://127.0.0.1:` servers directly, as
 it does any server on the user's own network. A module instance runs regtest when
 its persistence directory holds `regtest.json`.
 
 logos-zebra-nix builds both processes: `regtest-zebrad` runs zebrad's command line on
-libzebrad_c, and `lightwalletd` is v0.5.4. `nix build .#regtest-chain` packages the script
+libzebrad_c, and `lightwalletd` is v0.5.5. `nix build .#regtest-chain` packages the script
 with `regtest.json` (in `share/regtest/`) for harnesses outside this repository, such as
 the app's doctest. The script also runs under Git Bash on Windows, against zebra-nix's
 Windows builds of both processes; `packages.x86_64-windows.regtest-chain` packages it for the
