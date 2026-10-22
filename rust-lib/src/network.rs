@@ -6,10 +6,6 @@ use serde::Deserialize;
 use zcash_protocol::consensus::{self, BlockHeight, NetworkType, NetworkUpgrade, Parameters};
 use zcash_protocol::local_consensus::LocalNetwork;
 
-/// NU7's mainnet height, set here the day ZIP 259 fixes it (due 2026-10-20) if the
-/// final crates are late. Branch IDs follow from it.
-pub const MAINNET_NU7_OVERRIDE: Option<u32> = None;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ZNetwork {
     Main,
@@ -114,11 +110,10 @@ impl Parameters for ZNetwork {
     }
 
     fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
-        match (self, nu, MAINNET_NU7_OVERRIDE) {
-            (ZNetwork::Main, NetworkUpgrade::Nu7, Some(h)) => Some(BlockHeight::from(h)),
-            (ZNetwork::Main, _, _) => consensus::Network::MainNetwork.activation_height(nu),
-            (ZNetwork::Test, _, _) => consensus::Network::TestNetwork.activation_height(nu),
-            (ZNetwork::Regtest, _, _) => REGTEST.get().and_then(|l| l.activation_height(nu)),
+        match self {
+            ZNetwork::Main => consensus::Network::MainNetwork.activation_height(nu),
+            ZNetwork::Test => consensus::Network::TestNetwork.activation_height(nu),
+            ZNetwork::Regtest => REGTEST.get().and_then(|l| l.activation_height(nu)),
         }
     }
 }
@@ -128,11 +123,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mainnet_nu7_is_unset_until_zip_259_fixes_it() {
-        // The pre-release crates carry no mainnet height; sends near it are handled by
-        // expiry_for, and the release gate checks this before any mainnet release.
-        assert_eq!(MAINNET_NU7_OVERRIDE, None);
-        assert_eq!(ZNetwork::Main.activation_height(NetworkUpgrade::Nu7), None);
+    fn mainnet_branch_after_nu7() {
+        // ZIP 259 activates NU7 on mainnet at 3,543,405; zcash_protocol 0.11.0 carries it.
+        assert_eq!(ZNetwork::Main.activation_height(NetworkUpgrade::Nu7), Some(BlockHeight::from(3_543_405)));
+        assert_eq!(ZNetwork::Main.branch_id_hex(BlockHeight::from(3_543_405)), "77190ad9");
+        assert_ne!(ZNetwork::Main.branch_id_hex(BlockHeight::from(3_543_404)), "77190ad9");
     }
 
     #[test]

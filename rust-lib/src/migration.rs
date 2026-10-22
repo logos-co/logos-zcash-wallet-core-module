@@ -22,6 +22,7 @@ use zcash_pool_migration::state::{AdvanceStep, StepKind};
 use zcash_pool_migration::wallet::{WalletMigration, WalletMigrationProver};
 use zcash_primitives::transaction::fees::zip317::{GRACE_ACTIONS, MARGINAL_FEE};
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
+use zcash_protocol::zip318::BlockSpacing;
 
 use crate::keys::Phrase;
 use crate::network::ZNetwork;
@@ -29,8 +30,6 @@ use crate::wallet::Db;
 
 /// Ten blocks of settling before a displacement counts as permanent, as zcash-devtool uses.
 const REORG_SETTLE_DEPTH: ReorgSettleDepth = ReorgSettleDepth::new(10);
-/// Our estimate of NU7's mainnet height until ZIP 259 fixes it on 2026-10-20.
-const MAINNET_NU7_ESTIMATE: u32 = 3_542_100;
 /// No part of a run may broadcast within this many blocks plus two hours of NU7.
 const NU7_GUARD_BLOCKS: u32 = 576;
 
@@ -49,12 +48,9 @@ fn ufvk(db: &Db, account: AccountUuid) -> Result<zcash_keys::keys::UnifiedFullVi
     acct.ufvk().cloned().ok_or_else(|| "the account has no full viewing key".into())
 }
 
-/// The NU7 height a run must stay clear of, real or estimated.
+/// The NU7 height a run must stay clear of.
 fn nu7_height(params: &ZNetwork) -> Option<u32> {
-    params.activation_height(NetworkUpgrade::Nu7).map(u32::from).or(match params {
-        ZNetwork::Main => Some(MAINNET_NU7_ESTIMATE),
-        ZNetwork::Test | ZNetwork::Regtest => None,
-    })
+    params.activation_height(NetworkUpgrade::Nu7).map(u32::from)
 }
 
 /// Blocks in two hours, at the spacing in force at `h`.
@@ -172,7 +168,7 @@ pub fn drive(
     let tip = db.chain_height().map_err(|e| e.to_string())?.ok_or("the wallet is not synced")?;
     let targets = DuenessTargets::new(scanned + 1, tip + 1);
     let prep_anchor = checkpoint_at_or_below(db, scanned)?.unwrap_or(scanned);
-    let config = AdvanceConfig::new(REORG_SETTLE_DEPTH);
+    let config = AdvanceConfig::new(REORG_SETTLE_DEPTH, BlockSpacing::for_network(&params));
     let mut rng = rng();
 
     let (advance, mut state) = {

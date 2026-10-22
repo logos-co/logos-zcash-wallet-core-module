@@ -115,7 +115,7 @@ impl ZcashWalletCoreModule for ZcashWalletCoreModuleImpl {
         json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
-            "crates": {"zcash_client_backend": "0.25.0-pre.1", "zcash_client_sqlite": "0.23.0-pre.1", "zcash_protocol": "0.11.0-pre.0"},
+            "crates": {"zcash_client_backend": "0.25.0", "zcash_client_sqlite": "0.23.0", "zcash_protocol": "0.11.0"},
         })
         .to_string()
     }

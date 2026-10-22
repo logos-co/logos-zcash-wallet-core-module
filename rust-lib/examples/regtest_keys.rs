@@ -27,7 +27,7 @@ fn main() {
         ))
         .unwrap();
     use zcash_transparent::keys::{IncomingViewingKey, NonHardenedChildIndex};
-    let taddr = ufvk.transparent().unwrap().derive_external_ivk().unwrap().derive_address(NonHardenedChildIndex::ZERO).unwrap();
+    let taddr = ufvk.p2pkh().unwrap().derive_external_ivk().unwrap().derive_address(NonHardenedChildIndex::ZERO).unwrap();
     println!("{}", serde_json::json!({
         "phrase": phrase.as_str(),
         "orchardUa": orchard_ua.encode(&net),

@@ -12,9 +12,11 @@ C="${CHAIN_DIR:-$PWD/chain}"; mkdir -p "$C"
 ZEBRAD="${ZEBRAD:?set ZEBRAD to a zebrad binary}"; LWD="${LIGHTWALLETD:?set LIGHTWALLETD to a lightwalletd binary}"
 RPC_PORT="${RPC_PORT:-28232}"; P2P_PORT="${P2P_PORT:-28233}"; RPC="127.0.0.1:$RPC_PORT"
 LWD_PORTS=(29061 29063)
-# sed reads the two numbers taken from JSON, so the script needs only curl and perl.
+# sed reads the numbers taken from JSON, so the script needs only curl and perl.
 json_num() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p"; }
 NU6_3=$(json_num nu6_3 < "$HERE/regtest.json")
+# Empty when regtest.json has "nu7": null; zebrad then never activates NU7.
+NU7=$(json_num nu7 < "$HERE/regtest.json")
 # Own session, so stopping whatever started the chain does not take it down. perl execs the
 # daemon, so `$!` is the daemon's own PID. Git Bash on Windows has no sessions to leave; it
 # runs native daemons, whose Windows PIDs taskkill needs, and they read Windows paths.
@@ -59,6 +61,7 @@ NU6 = 1
 "NU6.1" = 1
 "NU6.2" = 1
 "NU6.3" = $NU6_3
+${NU7:+NU7 = $NU7}
 [rpc]
 listen_addr = "$RPC"
 enable_cookie_auth = false
