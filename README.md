@@ -14,7 +14,10 @@ which holds the roles; this module holds the keys.
   small files; the database is not re-keyed.
 - **Encrypted storage.** The wallet database and the block cache are SQLCipher
   (`rusqlite` `bundled-sqlcipher`: CommonCrypto on Apple, vendored OpenSSL elsewhere),
-  opened through `WalletDb::from_connection`.
+  opened through `WalletDb::from_connection`. Each open first applies the
+  `zcash_client_sqlite` migrations the database lacks, so a wallet made by an older build
+  is brought up to date; a migration that needs the seed unseals it with the password
+  given to open.
 - **Sync over Tor.** Every call goes through a `socks5h://` proxy; SOCKS credentials pick
   the circuit. Two exceptions, both reached directly:
   - servers on the user's own network, which Tor cannot reach: private, loopback, CGNAT and
