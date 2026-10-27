@@ -1059,6 +1059,11 @@ mod tests {
         r.direct = vec![onion.clone()];
         assert!(r.config().is_err());
         assert!(routes("direct", &[rocks], &[]).config().is_err());
+        // The built-in Tor, which the node module names `tor`, is reached over IPC.
+        let mut r = routes("tor", &[rocks, onion.as_str()], &[]);
+        r.direct = vec![rocks.into()];
+        let cfg = r.config().unwrap();
+        assert!(cfg.proxy.is_tor() && cfg.proxy.bypasses(rocks));
         // An empty broadcast list syncs but leaves nothing to send through.
         let mut r = routes(tor, &[LOCAL_NODE_URL], &[]);
         r.broadcast = Some(vec![]);

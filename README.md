@@ -18,8 +18,11 @@ which holds the roles; this module holds the keys.
   `zcash_client_sqlite` migrations the database lacks, so a wallet made by an older build
   is brought up to date; a migration that needs the seed unseals it with the password
   given to open.
-- **Sync over Tor.** Every call goes through a `socks5h://` proxy; SOCKS credentials pick
-  the circuit. Two exceptions, both reached directly:
+- **Sync over Tor.** Every call goes through Tor: the Tor that comes with Logos
+  (`tor_module`), reached over Logos IPC, where each gRPC call is one HTTP/2 request it makes
+  and TLS is its job; or the user's own, through a `socks5h://` proxy. Either way each client
+  takes its own circuit (an isolation key, or SOCKS credentials). Two exceptions, both
+  reached directly:
   - servers on the user's own network, which Tor cannot reach: private, loopback, CGNAT and
     link-local addresses, or `.local`, `.lan`, `.home.arpa` and `.internal` names that resolve
     only to such addresses;
@@ -59,7 +62,8 @@ Every structured value is a JSON string: `{ "ok": true, ... }` or `{ "ok": false
 Events: `wallet_state_changed`, `sync_progress`, `balance_changed`, `job_finished`.
 
 Job parameters carry the route table the backend got from `zcash_node_module`:
-`{ "routes": { "proxy": "socks5h://127.0.0.1:9050", "servers": ["https://..."], "direct": ["https://..."] } }`.
+`{ "routes": { "proxy": "tor", "servers": ["https://..."], "direct": ["https://..."] } }`.
+The proxy is `tor` for the built-in Tor, or the user's own as `socks5h://host:port`.
 `direct`, optional, lists the servers to reach without Tor. When nothing goes through Tor, the
 proxy may be `"direct"`, which means none.
 

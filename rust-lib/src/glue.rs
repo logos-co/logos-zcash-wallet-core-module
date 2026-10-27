@@ -216,7 +216,73 @@ impl ZcashWalletCoreModule for ZcashWalletCoreModuleImpl {
                 .find(|d| d.join("sapling-spend.params").is_file())
         });
         crate::net::ipc::set_local_node(Arc::new(ZebradIpc::default()));
+        crate::net::tor::set_tor(Arc::new(TorIpc::default()));
         let _ = self.engine.set(Engine::new(dir.join("wallets"), sink, None, params));
+    }
+}
+
+/// The built-in Tor over IPC: tor_module's requests, asked after until each answer is in.
+/// The client is made on first use and kept: each new one opens its own connection.
+#[derive(Default)]
+struct TorIpc(std::sync::OnceLock<tor_module::TorModuleClient>);
+
+/// One call to tor_module, which answers each at once.
+const TOR_CALL: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often a request in flight is asked after.
+const TOR_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+/// A gRPC call's whole budget at tor_module: a grid chunk of blocks can be several MB.
+const TOR_REQUEST_MS: u64 = 300_000;
+
+type Reply = std::sync::mpsc::SyncSender<Result<String, String>>;
+
+impl TorIpc {
+    /// Async, then waited for here: a blocking call waits in a nested event loop on the main
+    /// thread, and concurrent ones nest there and return only innermost first.
+    fn call(&self, send: impl FnOnce(&tor_module::TorModuleClient, Reply)) -> Result<Value, String> {
+        let client = self.0.get_or_init(tor_module::TorModuleClient::new);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        send(client, tx);
+        let reply = rx
+            .recv_timeout(TOR_CALL + std::time::Duration::from_millis(500))
+            .map_err(|_| "tor_module did not answer".to_string())??;
+        serde_json::from_str(&reply).map_err(|e| format!("tor_module: {e}"))
+    }
+}
+
+fn answer(tx: Reply) -> impl FnOnce(Result<String, logos_rust_sdk::LogosError>) + Send + 'static {
+    move |r| {
+        let _ = tx.send(r.map_err(|e| e.to_string()));
+    }
+}
+
+impl crate::net::tor::TorRequests for TorIpc {
+    fn grpc(&self, url: &str, body: &[u8], key: &str) -> (i32, String, Vec<u8>) {
+        use crate::net::tor::{closed, grpc_answer, UNAVAILABLE};
+        let unavailable = |e: String| (UNAVAILABLE, e, Vec::new());
+        let refused = |v: &Value| unavailable(format!("tor_module: {}", v["error"].as_str().unwrap_or("refused")));
+        let spec = serde_json::json!({
+            "method": "POST", "url": url, "http2": true, "isolation": key, "timeoutMs": TOR_REQUEST_MS,
+            "headers": [["content-type", "application/grpc"], ["te", "trailers"]],
+        })
+        .to_string();
+        let id = match self.call(|c, tx| c.request_async_with_timeout(&spec, body, TOR_CALL, answer(tx))) {
+            Ok(v) if v["ok"] == true => v["request"].as_str().unwrap_or_default().to_string(),
+            Ok(v) => return refused(&v),
+            Err(e) => return unavailable(e),
+        };
+        loop {
+            // Unloading: tor_module drops the request once its timeout passes.
+            if closed() {
+                return unavailable("the wallet is unloading".into());
+            }
+            std::thread::sleep(TOR_POLL);
+            match self.call(|c, tx| c.response_async_with_timeout(&id, TOR_CALL, answer(tx))) {
+                Ok(v) if v["ok"] == true && v["state"] == "pending" => continue,
+                Ok(v) if v["ok"] == true => return grpc_answer(&v),
+                Ok(v) => return refused(&v),
+                Err(e) => return unavailable(e),
+            }
+        }
     }
 }
 
@@ -261,8 +327,10 @@ impl crate::net::ipc::GrpcCall for ZebradIpc {
 impl AboutToUnload for ZcashWalletCoreModuleImpl {
     /// Stops sync between bounded steps and joins the threads, well inside the
     /// host's grace period. Local-node calls are answered first: they run on this thread.
+    /// Calls to tor_module in flight end within 0.3 s, and none starts after.
     fn about_to_unload(&self) -> Shutdown {
         crate::net::ipc::close();
+        crate::net::tor::close(std::time::Duration::from_millis(300));
         if let Some(e) = self.engine.get() {
             e.shutdown();
         }

@@ -35,6 +35,15 @@ impl ProxyAddr {
         self.host == "direct" && self.port == 0
     }
 
+    /// The built-in Tor, reached over Logos IPC rather than a port.
+    pub fn tor() -> Self {
+        Self { host: "tor".into(), port: 0, bypass: Arc::default() }
+    }
+
+    pub fn is_tor(&self) -> bool {
+        self.host == "tor" && self.port == 0
+    }
+
     pub fn bypassing(mut self, servers: impl IntoIterator<Item = String>) -> Self {
         self.bypass = Arc::new(servers.into_iter().collect());
         self
@@ -44,7 +53,11 @@ impl ProxyAddr {
         self.bypass.contains(server)
     }
 
+    /// `tor`, the built-in Tor, or the user's own as socks5h://host:port.
     pub fn parse(url: &str) -> Result<Self, String> {
+        if url == "tor" {
+            return Ok(Self::tor());
+        }
         let rest = url
             .strip_prefix(SCHEME)
             .ok_or_else(|| format!("proxy must be {SCHEME}host:port"))?;
@@ -69,6 +82,11 @@ pub struct Isolation {
 }
 
 impl Isolation {
+    /// The key the built-in Tor isolates on: the same circuit as these credentials would get.
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.user, self.pass)
+    }
+
     /// A circuit no other request will use.
     pub fn fresh() -> Self {
         let mut bytes = [0u8; 24];
@@ -136,6 +154,7 @@ mod tests {
         assert!(ProxyAddr::parse("http://127.0.0.1:8118").is_err());
         assert!(ProxyAddr::parse("socks5h://127.0.0.1").is_err());
         assert!(ProxyAddr::parse("socks5h://direct:0").is_err());
+        assert!(ProxyAddr::parse("tor").unwrap().is_tor() && !ProxyAddr::parse("socks5h://tor:9050").unwrap().is_tor());
     }
 
     #[test]

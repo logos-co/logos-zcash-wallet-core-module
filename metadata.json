@@ -6,10 +6,10 @@
   "interface": "cdylib",
   "concurrency": "multi",
   "category": "wallet",
-  "description": "Zcash wallet engine: librustzcash light client with keys sealed at rest, a SQLCipher database, and sync over Tor on a fixed download grid. Answers only zcash_wallet_backend.",
+  "description": "Zcash wallet engine: librustzcash light client with keys sealed at rest, a SQLCipher database, and sync over Tor on a fixed download grid: the Tor that comes with Logos over IPC (tor_module), or the user's own. Answers only zcash_wallet_backend.",
   "author": "Logos Core Team",
   "main": "zcash_wallet_core_module_plugin",
-  "dependencies": [],
+  "dependencies": ["tor_module"],
   "optional_dependencies": ["zebrad_module"],
   "include": [
     "sapling-spend.params",
