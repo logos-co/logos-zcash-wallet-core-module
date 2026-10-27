@@ -409,7 +409,9 @@ impl Engine {
         let meta = dir.meta().map_err(|e| e.to_string())?;
         let account = dir.account().map_err(|e| e.to_string())?;
         let key = dir.unlock_db_key(password).map_err(|e| e.to_string())?;
-        let writer = dir.open_db(network, &key).map_err(|e| e.to_string())?;
+        let mut writer = dir.open_db(network, &key).map_err(|e| e.to_string())?;
+        // Before anything reads it: a wallet made by an older build may lack migrations.
+        dir.migrate(&mut writer, password).map_err(|e| e.to_string())?;
         let reader = dir.open_conn(&key).map_err(|e| e.to_string())?;
         let cache = Arc::new(dir.open_cache(&key).map_err(|e| e.to_string())?);
         let mig_conn = dir.open_conn(&key).map_err(|e| e.to_string())?;
@@ -1063,22 +1065,67 @@ mod tests {
         assert!(r.config().unwrap().broadcast.is_empty());
     }
 
+    /// Runs a job to its end and panics unless it succeeded.
+    fn run(engine: &Engine, kind: &str, params: &Value) {
+        let job = engine.start_job(kind, params.to_string());
+        let (id, receipt) = (job["jobId"].as_str().unwrap(), job["receipt"].as_str().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let st = engine.jobs().status(id, receipt);
+            match st["state"].as_str() {
+                Some("done") => return,
+                Some("queued" | "running") if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                _ => panic!("{kind}: {st}"),
+            }
+        }
+    }
+
+    /// A restore starts from a bundled checkpoint, so nothing is fetched; sync only tries.
+    fn restore_params() -> Value {
+        json!({"network": "mainnet", "name": "r", "password": "pw", "phrase": Phrase::generate().as_str(),
+               "birthdayHeight": 3_000_000, "routes": {"proxy": "socks5h://127.0.0.1:9", "servers": ["https://zec.rocks:443"]}})
+    }
+
     #[test]
     fn a_restored_wallet_is_open() {
         let root = tempfile::tempdir().unwrap();
         let engine = Engine::new(root.path().to_path_buf(), Arc::new(|_| {}), Some(10), None);
-        // A restore starts from a bundled checkpoint, so nothing is fetched; sync only tries.
-        let params = json!({"network": "mainnet", "name": "r", "password": "pw", "phrase": Phrase::generate().as_str(),
-                            "birthdayHeight": 3_000_000, "routes": {"proxy": "socks5h://127.0.0.1:9", "servers": ["https://zec.rocks:443"]}});
-        let job = engine.start_job("restore_wallet", params.to_string());
-        let (id, receipt) = (job["jobId"].as_str().unwrap(), job["receipt"].as_str().unwrap());
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while engine.jobs().status(id, receipt)["state"] != "done" {
-            assert!(std::time::Instant::now() < deadline, "{}", engine.jobs().status(id, receipt));
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        run(&engine, "restore_wallet", &restore_params());
         let st = engine.wallet_status();
         assert_eq!((&st["open"], &st["name"]), (&json!(true), &json!("r")), "{st}");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn open_applies_missing_migrations() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path().to_path_buf(), Arc::new(|_| {}), Some(10), None);
+        let params = restore_params();
+        run(&engine, "restore_wallet", &params);
+        engine.close();
+        // A wallet made under 0.23.0-pre.1 lacks 0.23.0's data-only restore_ua_transparent_receivers.
+        let dir = WalletDir::new(root.path(), ZNetwork::Main, "r");
+        let conn = dir.open_conn(&dir.unlock_db_key("pw").unwrap()).unwrap();
+        let id = uuid::Uuid::parse_str("3eb2409c-6b54-476e-aebc-8f769aa8950f").unwrap();
+        let id = &id.as_bytes()[..];
+        let applied = || conn.query_row("SELECT count(*) FROM schemer_migrations WHERE id = ?1", [id], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(conn.execute("DELETE FROM schemer_migrations WHERE id = ?1", [id]).unwrap(), 1);
+        assert_eq!(applied(), 0);
+
+        // data_version moves when another connection commits.
+        let data_version = || conn.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0)).unwrap();
+        let open = json!({"network": "mainnet", "name": "r", "password": "pw", "routes": params["routes"]});
+        let before = data_version();
+        run(&engine, "open_wallet", &open);
+        engine.close();
+        assert_eq!(applied(), 1);
+        assert_ne!(data_version(), before);
+
+        // A second open has nothing to apply, and commits nothing.
+        let before = data_version();
+        run(&engine, "open_wallet", &open);
+        engine.close();
+        assert_eq!(data_version(), before);
         engine.shutdown();
     }
 

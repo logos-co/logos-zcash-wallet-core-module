@@ -1,6 +1,7 @@
 //! A wallet on disk: public metadata, the sealed seed and database key, the
 //! SQLCipher wallet database and the block cache.
 
+use std::error::Error as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +10,8 @@ use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use zcash_client_backend::data_api::{chain::ChainState, AccountBirthday, WalletWrite};
 use zcash_client_backend::util::SystemClock;
-use zcash_client_sqlite::{wallet::init::init_wallet_db, AccountUuid, WalletDb};
+use zcash_client_sqlite::wallet::init::{init_wallet_db, WalletMigrationError};
+use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zeroize::Zeroizing;
 
 use crate::keys::{self, KeyError, Phrase};
@@ -44,6 +46,8 @@ pub enum WalletError {
     Cache(#[from] CacheError),
     #[error("wallet database: {0}")]
     Db(String),
+    #[error("the wallet database could not be updated: {0}")]
+    Migration(String),
     #[error("a wallet named {0} already exists")]
     Exists(String),
     #[error("no wallet named {0}")]
@@ -156,6 +160,26 @@ impl WalletDir {
 
     pub fn open_conn(&self, key: &[u8; 32]) -> Result<rusqlite::Connection, WalletError> {
         Ok(open_encrypted(&self.path.join(DB), key)?)
+    }
+
+    /// Applies the migrations this build's zcash_client_sqlite has and the database lacks,
+    /// as the library expects at every start. One that needs the seed gets it unsealed with `password`.
+    pub fn migrate(&self, db: &mut Db, password: &str) -> Result<(), WalletError> {
+        let needs_seed = |e: &dyn std::error::Error| {
+            matches!(e.source().and_then(|s| s.downcast_ref::<WalletMigrationError>()), Some(WalletMigrationError::SeedRequired))
+        };
+        let migrated = match init_wallet_db(db, None) {
+            Err(e) if needs_seed(&e) => init_wallet_db(db, Some(self.unseal_phrase(password)?.seed())),
+            r => r,
+        };
+        migrated.map_err(|e| {
+            let msg = e.to_string();
+            // A failed migration's message carries its cause; the adapter's does not.
+            WalletError::Migration(match e.source().map(|c| c.to_string()) {
+                Some(cause) if !msg.contains(&cause) => format!("{msg} {cause}"),
+                _ => msg,
+            })
+        })
     }
 
     pub fn open_cache(&self, key: &[u8; 32]) -> Result<BlockCache, WalletError> {
