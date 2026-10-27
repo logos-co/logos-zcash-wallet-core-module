@@ -41,6 +41,17 @@ pub const HEAD: u32 = 100;
 const CROSS_CHECK_EVERY: Duration = Duration::from_secs(120);
 const RECHECK_AFTER: Duration = Duration::from_secs(20);
 
+/// A new tip at most HOLD_GAP blocks past the synced one waits for its blocks, HOLD_FOR at
+/// most (see `take_tip`).
+const HOLD_GAP: u32 = 10;
+const HOLD_FOR: Duration = Duration::from_secs(45);
+
+/// Whether a new tip waits for its blocks: it extends, by a few blocks within one chunk, the
+/// tip the wallet is fully scanned to.
+fn holds(old: u32, new: u32, scanned: Option<u32>) -> bool {
+    new > old && new - old <= HOLD_GAP && grid_floor(new) == grid_floor(old) && scanned.is_some_and(|s| s >= old)
+}
+
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     pub proxy: ProxyAddr,
@@ -183,6 +194,8 @@ pub struct Syncer {
     tip_in_flight: bool,
     last_tip_poll: Option<Instant>,
     tip: Option<u32>,
+    /// A newer tip held back while its blocks download, and since when.
+    held: Option<(u32, Instant)>,
     /// Subtree roots stored this session per pool (Sapling, Orchard, Ironwood), and the shards
     /// a window last needed when they were fetched.
     roots: Option<[u64; 3]>,
@@ -236,6 +249,7 @@ impl Syncer {
             tip_in_flight: false,
             last_tip_poll: None,
             tip: None,
+            held: None,
             roots: None,
             roots_asked: [0; 3],
             next_server: 0,
@@ -291,6 +305,7 @@ impl Syncer {
             self.handle(db, msg)?;
         }
         self.poll_tip_if_due();
+        self.advance_held(db)?;
         let Some(tip) = self.tip else {
             self.progress.state = "connecting".into();
             return Ok(Step::Waiting);
@@ -331,6 +346,53 @@ impl Syncer {
         });
     }
 
+    /// A tip that `holds` waits until its blocks are cached, and is written right before they
+    /// are scanned: written first, the wallet would count its newest notes as pending for the
+    /// whole download, seconds over Tor. Any other tip is written at once.
+    fn take_tip(&mut self, db: &mut Db, tip: u32) -> Result<(), SyncError> {
+        if let Some(old) = self.tip {
+            let scanned = db.block_fully_scanned().map_err(db_err)?.map(|m| u32::from(m.block_height()));
+            if holds(old, tip, scanned) && self.cache.chunk_end(grid_floor(old))?.is_some() {
+                let since = self.held.map_or_else(Instant::now, |(_, since)| since);
+                self.held = Some((tip, since));
+                return Ok(());
+            }
+        }
+        self.held = None;
+        if self.tip != Some(tip) {
+            db.update_chain_tip(BlockHeight::from(tip)).map_err(db_err)?;
+            self.tip = Some(tip);
+        }
+        self.progress.tip = Some(tip);
+        Ok(())
+    }
+
+    /// Writes a held tip once its blocks are cached, or once it has waited HOLD_FOR; until
+    /// then fetches them.
+    fn advance_held(&mut self, db: &mut Db) -> Result<(), SyncError> {
+        let (Some((tip, since)), Some(old)) = (self.held, self.tip) else {
+            return Ok(());
+        };
+        let have = self.cache.contiguous_end(old + 1)?;
+        if have > tip || since.elapsed() >= HOLD_FOR {
+            self.held = None;
+            db.update_chain_tip(BlockHeight::from(tip)).map_err(db_err)?;
+            self.tip = Some(tip);
+            self.progress.tip = Some(tip);
+            return Ok(());
+        }
+        let start = grid_floor(tip);
+        if self.tails_in_flight.contains(&start) || self.retry.get(&start).is_some_and(|r| Instant::now() < r.1) {
+            return Ok(());
+        }
+        self.tails_in_flight.insert(start);
+        let (server, proxy, tx) = (self.server_for(), self.cfg.proxy.clone(), self.tx.clone());
+        self.rt.spawn(async move {
+            let _ = tx.send(Msg::Tail(start, have, fetch::fetch_blocks(&server, &proxy, have, tip).await));
+        });
+        Ok(())
+    }
+
     /// Reading from the local node, the servers that send transactions take turns checking it.
     fn cross_check_if_due(&mut self) {
         let checkers: Vec<String> = self.cfg.broadcast.iter().filter(|s| *s != LOCAL_NODE_URL).cloned().collect();
@@ -358,11 +420,7 @@ impl Syncer {
                             self.fail(ErrorSource::Tip, &e);
                             return Err(e);
                         }
-                        if self.tip.is_none_or(|t| t != tip) {
-                            db.update_chain_tip(BlockHeight::from(tip)).map_err(db_err)?;
-                            self.tip = Some(tip);
-                        }
-                        self.progress.tip = Some(tip);
+                        self.take_tip(db, tip)?;
                         self.succeed(ErrorSource::Tip);
                     }
                     Err(e) => {
@@ -903,5 +961,19 @@ mod tests {
         assert!(within(retry_delay(1), 1));
         assert!(within(retry_delay(3), 4));
         assert!(within(retry_delay(40), 60));
+    }
+
+    #[test]
+    fn only_a_followed_tip_waits_for_its_blocks() {
+        // Synced to 4,548,993 when 4,548,994 comes: it waits.
+        assert!(holds(4_548_993, 4_548_994, Some(4_548_993)));
+        assert!(holds(4_548_980, 4_548_980 + HOLD_GAP, Some(4_548_980)));
+        // Still scanning toward the old tip, too far ahead, into the next chunk, or not ahead.
+        assert!(!holds(4_548_993, 4_548_994, Some(4_548_900)));
+        assert!(!holds(4_548_993, 4_548_994, None));
+        assert!(!holds(4_548_980, 4_548_981 + HOLD_GAP, Some(4_548_980)));
+        assert!(!holds(4_548_999, 4_549_000, Some(4_548_999)));
+        assert!(!holds(4_548_993, 4_548_993, Some(4_548_993)));
+        assert!(!holds(4_548_993, 4_548_990, Some(4_548_993)));
     }
 }
