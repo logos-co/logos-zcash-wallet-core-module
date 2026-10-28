@@ -1,5 +1,7 @@
 //! Downloads on the grid. Each chunk travels on its own Tor circuit.
 
+use std::time::Duration;
+
 use futures_util::TryStreamExt;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::{BlockId, BlockRange, ChainSpec, Empty, LightdInfo, PoolType, TreeState};
@@ -11,6 +13,18 @@ pub const ALL_POOLS: [PoolType; 4] = [PoolType::Transparent, PoolType::Sapling, 
 
 pub(super) fn status(server: &str) -> impl Fn(tonic::Status) -> NetError + '_ {
     move |status| NetError::Status { server: server.into(), status }
+}
+
+/// Each call of a tip poll gives up after this: polls are 30 s apart, and a stalled one would
+/// hold up the next.
+pub const TIP_CALL: Duration = Duration::from_secs(60);
+
+/// `msg` as a call with a grpc-timeout: tonic's own channels enforce it, and the Tor channel
+/// hands it to tor_module as the request's timeout.
+fn within<T>(msg: T, budget: Duration) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(msg);
+    req.set_timeout(budget);
+    req
 }
 
 /// A grid chunk: the tree state just below `start`, and blocks start..=last.
@@ -57,8 +71,8 @@ pub async fn fetch_blocks(server: &str, proxy: &ProxyAddr, first: u32, last: u32
 
 pub async fn tip_and_info(server: &str, proxy: &ProxyAddr, iso: Isolation) -> Result<(u32, LightdInfo), NetError> {
     let mut c = connect(server, proxy, iso).await?;
-    let info = c.get_lightd_info(Empty {}).await.map_err(status(server))?.into_inner();
-    let tip = c.get_latest_block(ChainSpec {}).await.map_err(status(server))?.into_inner().height as u32;
+    let info = c.get_lightd_info(within(Empty {}, TIP_CALL)).await.map_err(status(server))?.into_inner();
+    let tip = c.get_latest_block(within(ChainSpec {}, TIP_CALL)).await.map_err(status(server))?.into_inner().height as u32;
     Ok((tip, info))
 }
 

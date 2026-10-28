@@ -34,7 +34,8 @@ which holds the roles; this module holds the keys.
   states are fetched only at chunk boundaries; a scan that starts mid-chunk advances the
   boundary state through cached blocks (`sync::frontier`). Each chunk must continue the tree
   state below it and lead to the one above. Scan calls are capped at about 2,000 shielded
-  outputs, so a stop request is honoured within a second.
+  outputs, so a stop request is honoured within a second. The tip is polled every 30 s, and
+  each of a poll's calls gives up after 60 s.
 - **Restore without a lookup.** Restores start from a bundled checkpoint
   (`checkpoints/*.json`, every 10,000 blocks; mainnet entries agree across two operators),
   so no server learns the birthday. `examples/checkpoints.rs` rebuilds them.

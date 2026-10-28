@@ -16,10 +16,10 @@ use serde_json::Value;
 use super::ipc::{BoxError, TransportError};
 
 /// One gRPC call through tor_module: the framed request body to `url` on the circuit `key`
-/// names; the grpc-status, its message and the framed response body back. Failures to reach
-/// Tor come back as a status too (UNAVAILABLE).
+/// names, within the call's own `budget` if it set one; the grpc-status, its message and the
+/// framed response body back. Failures to reach Tor come back as a status too (UNAVAILABLE).
 pub trait TorRequests: Send + Sync {
-    fn grpc(&self, url: &str, body: &[u8], key: &str) -> (i32, String, Vec<u8>);
+    fn grpc(&self, url: &str, body: &[u8], key: &str, budget: Option<Duration>) -> (i32, String, Vec<u8>);
 }
 
 static TOR: RwLock<Option<Arc<dyn TorRequests>>> = RwLock::new(None);
@@ -102,6 +102,22 @@ pub fn grpc_answer(reply: &Value) -> (i32, String, Vec<u8>) {
     }
 }
 
+/// A call's grpc-timeout header, up to 8 digits and a unit, as tonic's `set_timeout` writes it.
+fn grpc_timeout(headers: &http::HeaderMap) -> Option<Duration> {
+    let v = headers.get("grpc-timeout")?.to_str().ok()?;
+    let (n, unit) = v.split_at(v.len().checked_sub(1)?);
+    let n: u64 = n.parse().ok()?;
+    Some(match unit {
+        "H" => Duration::from_secs(n.saturating_mul(3600)),
+        "M" => Duration::from_secs(n.saturating_mul(60)),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        _ => return None,
+    })
+}
+
 /// A tower service a tonic client runs over, in place of a network channel: every call goes
 /// to `server` on the circuit `key` names.
 #[derive(Clone)]
@@ -119,6 +135,7 @@ impl TorChannel {
     async fn forward(self, req: http::Request<tonic::body::Body>) -> Result<http::Response<tonic::body::Body>, BoxError> {
         let path = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
         let url = format!("{}{path}", self.server);
+        let budget = grpc_timeout(req.headers());
         let body = req.into_body().collect().await?.to_bytes();
         // The IPC calls block; keep them off the async workers.
         let (tor, key) = (self.tor.clone(), self.key.clone());
@@ -126,7 +143,7 @@ impl TorChannel {
             let _active = Active::enter();
             match closed() {
                 true => (UNAVAILABLE, "the wallet is unloading".to_string(), Vec::new()),
-                false => tor.grpc(&url, &body, &key),
+                false => tor.grpc(&url, &body, &key, budget),
             }
         })
         .await?;
@@ -164,7 +181,7 @@ mod tests {
     use prost::Message;
     use serde_json::json;
     use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
-    use zcash_client_backend::proto::service::{BlockId, ChainSpec, Empty};
+    use zcash_client_backend::proto::service::{BlockId, ChainSpec, LightdInfo};
 
     fn frame(msg: &impl Message) -> Vec<u8> {
         let b = msg.encode_to_vec();
@@ -174,18 +191,28 @@ mod tests {
         out
     }
 
-    /// Answers as tor_module would, and records each URL and key.
+    /// Answers as tor_module would, and records each URL, key and budget.
     #[derive(Default)]
-    struct Fake(std::sync::Mutex<Vec<(String, String)>>);
+    struct Fake(std::sync::Mutex<Vec<(String, String, Option<Duration>)>>);
+
+    impl Fake {
+        fn budgets(&self) -> Vec<Option<Duration>> {
+            self.0.lock().unwrap().iter().map(|seen| seen.2).collect()
+        }
+    }
 
     impl TorRequests for Fake {
-        fn grpc(&self, url: &str, body: &[u8], key: &str) -> (i32, String, Vec<u8>) {
-            self.0.lock().unwrap().push((url.to_string(), key.to_string()));
+        fn grpc(&self, url: &str, body: &[u8], key: &str, budget: Option<Duration>) -> (i32, String, Vec<u8>) {
+            self.0.lock().unwrap().push((url.to_string(), key.to_string(), budget));
             let b64 = base64::engine::general_purpose::STANDARD;
+            let done = |msg: Vec<u8>| {
+                json!({ "state": "done", "status": 200, "headers": [], "trailers": [["grpc-status", "0"]], "body": b64.encode(msg) })
+            };
             let reply = if url.ends_with("/GetLatestBlock") {
                 assert_eq!(body, [0, 0, 0, 0, 0], "an empty ChainSpec, framed");
-                json!({ "state": "done", "status": 200, "headers": [], "trailers": [["grpc-status", "0"]],
-                        "body": b64.encode(frame(&BlockId { height: 4242, hash: vec![7; 32] })) })
+                done(frame(&BlockId { height: 4242, hash: vec![7; 32] }))
+            } else if url.ends_with("/GetLightdInfo") {
+                done(frame(&LightdInfo { chain_name: "test".into(), block_height: 4242, ..Default::default() }))
             } else {
                 json!({ "state": "failed", "error": "Tor is not running" })
             };
@@ -198,10 +225,52 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let mut c = CompactTxStreamerClient::new(TorChannel::new(fake.clone(), "https://zec.rocks:443/", "k1"));
         assert_eq!(c.get_latest_block(ChainSpec {}).await.unwrap().into_inner().height, 4242);
-        let e = c.get_lightd_info(Empty {}).await.unwrap_err();
+        let e = c.get_tree_state(BlockId { height: 1, hash: vec![] }).await.unwrap_err();
         assert_eq!((e.code(), e.message()), (tonic::Code::Unavailable, "Tor is not running"));
         let seen = fake.0.lock().unwrap().clone();
-        assert_eq!(seen[0], ("https://zec.rocks:443/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock".into(), "k1".into()));
+        assert_eq!(seen[0], ("https://zec.rocks:443/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock".into(), "k1".into(), None));
+    }
+
+    #[tokio::test]
+    async fn a_calls_grpc_timeout_is_its_budget_at_tor_module() {
+        let fake = Arc::new(Fake::default());
+        let mut c = CompactTxStreamerClient::new(TorChannel::new(fake.clone(), "https://zec.rocks:443/", "k1"));
+        let mut within = tonic::Request::new(ChainSpec {});
+        within.set_timeout(Duration::from_millis(1500));
+        c.get_latest_block(within).await.unwrap();
+        c.get_latest_block(ChainSpec {}).await.unwrap();
+        assert_eq!(fake.budgets(), [Some(Duration::from_millis(1500)), None]);
+    }
+
+    #[tokio::test]
+    async fn tip_polls_give_up_within_a_minute() {
+        let fake = Arc::new(Fake::default());
+        // The only test that installs a Tor: no other one reaches it.
+        set_tor(fake.clone());
+        let tor = crate::net::socks::ProxyAddr::tor();
+        let iso = crate::net::socks::Isolation::fresh();
+        let (tip, info) = crate::sync::fetch::tip_and_info("https://zec.rocks:443", &tor, iso).await.unwrap();
+        assert_eq!((tip, info.chain_name.as_str()), (4242, "test"));
+        assert_eq!(fake.budgets(), [Some(crate::sync::fetch::TIP_CALL); 2]);
+    }
+
+    #[test]
+    fn grpc_timeout_headers() {
+        let parse = |v: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("grpc-timeout", v.parse().unwrap());
+            grpc_timeout(&headers)
+        };
+        assert_eq!(parse("60000000u"), Some(Duration::from_secs(60)), "60 s, as tonic writes it");
+        assert_eq!(parse("5S"), Some(Duration::from_secs(5)));
+        assert_eq!(parse("2M"), Some(Duration::from_secs(120)));
+        assert_eq!(parse("1H"), Some(Duration::from_secs(3600)));
+        assert_eq!(parse("250m"), Some(Duration::from_millis(250)));
+        assert_eq!(parse("7n"), Some(Duration::from_nanos(7)));
+        for bad in ["", "S", "12", "12x", "1.5S", "-1S"] {
+            assert_eq!(parse(bad), None, "{bad:?}");
+        }
+        assert_eq!(grpc_timeout(&http::HeaderMap::new()), None);
     }
 
     #[test]
