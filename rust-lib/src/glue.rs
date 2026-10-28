@@ -230,9 +230,10 @@ struct TorIpc(std::sync::OnceLock<tor_module::TorModuleClient>);
 const TOR_CALL: std::time::Duration = std::time::Duration::from_secs(5);
 /// How often a request in flight is asked after.
 const TOR_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-/// A gRPC call's whole budget at tor_module: a grid chunk of blocks can be several MB. A call
-/// with a shorter grpc-timeout of its own, as a tip poll's, gets that.
+/// A gRPC call's whole budget at tor_module when it sets none. A call with a grpc-timeout of
+/// its own, as a tip poll's or a block range's, gets that, up to tor_module's limit.
 const TOR_REQUEST_MS: u64 = 300_000;
+const TOR_LIMIT_MS: u64 = 600_000;
 
 type Reply = std::sync::mpsc::SyncSender<Result<String, String>>;
 
@@ -262,7 +263,7 @@ impl crate::net::tor::TorRequests for TorIpc {
         let unavailable = |e: String| (UNAVAILABLE, e, Vec::new());
         let refused = |v: &Value| unavailable(format!("tor_module: {}", v["error"].as_str().unwrap_or("refused")));
         // tor_module takes 1 s to 10 min.
-        let timeout_ms = budget.map_or(TOR_REQUEST_MS, |b| b.as_millis().clamp(1_000, TOR_REQUEST_MS.into()) as u64);
+        let timeout_ms = budget.map_or(TOR_REQUEST_MS, |b| b.as_millis().clamp(1_000, TOR_LIMIT_MS.into()) as u64);
         let spec = serde_json::json!({
             "method": "POST", "url": url, "http2": true, "isolation": key, "timeoutMs": timeout_ms,
             "headers": [["content-type", "application/grpc"], ["te", "trailers"]],

@@ -30,12 +30,14 @@ which holds the roles; this module holds the keys.
     service is always reached through Tor.
 
   Compact blocks download in 1,000-block chunks from the tip down, one circuit
-  per chunk, so the request order says nothing about where the wallet's notes are. Tree
-  states are fetched only at chunk boundaries; a scan that starts mid-chunk advances the
-  boundary state through cached blocks (`sync::frontier`). Each chunk must continue the tree
-  state below it and lead to the one above. Scan calls are capped at about 2,000 shielded
-  outputs, so a stop request is honoured within a second. The tip is polled every 30 s, and
-  each of a poll's calls gives up after 60 s.
+  per chunk, so the request order says nothing about where the wallet's notes are. A chunk
+  comes 50 blocks a call, fewer if a call runs out of time: one from late 2022's spam is up
+  to ~100 MB, more than one request over Tor can carry. Tree states are fetched only at chunk
+  boundaries; a scan that starts mid-chunk advances the boundary state through cached blocks
+  (`sync::frontier`). Each chunk must continue the tree state below it and lead to the one
+  above. Scan calls are capped at about 2,000 shielded outputs, so a stop request is honoured
+  within a second. The tip is polled every 30 s, and each of a poll's calls gives up after
+  60 s.
 - **Restore without a lookup.** Restores start from a bundled checkpoint
   (`checkpoints/*.json`, every 10,000 blocks; mainnet entries agree across two operators),
   so no server learns the birthday. `examples/checkpoints.rs` rebuilds them.

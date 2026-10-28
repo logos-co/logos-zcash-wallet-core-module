@@ -6,7 +6,7 @@ use futures_util::TryStreamExt;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::{BlockId, BlockRange, ChainSpec, Empty, LightdInfo, PoolType, TreeState};
 
-use crate::net::client::{connect, NetError};
+use crate::net::client::{connect, Client, NetError};
 use crate::net::socks::{Isolation, ProxyAddr};
 
 pub const ALL_POOLS: [PoolType; 4] = [PoolType::Transparent, PoolType::Sapling, PoolType::Orchard, PoolType::Ironwood];
@@ -27,6 +27,47 @@ fn within<T>(msg: T, budget: Duration) -> tonic::Request<T> {
     req
 }
 
+/// Blocks per GetBlockRange call. Late 2022's spam averaged up to ~100 KB a block, and Tor gives
+/// a circuit ~25 KB/s, so a whole 1,000-block chunk in one call outran any budget.
+pub const BLOCKS_PER_CALL: u32 = 50;
+/// A call that runs out of time is made again in halves, down to this many blocks.
+const FEWEST_PER_CALL: u32 = 6;
+/// Each call gives up after this, tor_module's longest request.
+pub const BLOCKS_CALL: Duration = Duration::from_secs(600);
+
+/// Blocks first..=last on one client, so on one circuit.
+pub(crate) async fn block_range(c: &mut Client, server: &str, first: u32, last: u32) -> Result<Vec<CompactBlock>, NetError> {
+    let mut blocks = Vec::new();
+    let (mut from, mut per_call) = (first, BLOCKS_PER_CALL);
+    while from <= last {
+        let to = last.min(from + (per_call - 1));
+        let range = BlockRange {
+            start: Some(BlockId { height: from as u64, hash: vec![] }),
+            end: Some(BlockId { height: to as u64, hash: vec![] }),
+            pool_types: ALL_POOLS.iter().map(|p| *p as i32).collect(),
+        };
+        let part = match c.get_block_range(within(range, BLOCKS_CALL)).await {
+            Ok(stream) => stream.into_inner().try_collect::<Vec<CompactBlock>>().await,
+            Err(s) => Err(s),
+        };
+        match part {
+            Ok(part) => {
+                blocks.extend(part);
+                from = to + 1;
+            }
+            Err(s) if out_of_time(&s) && per_call > FEWEST_PER_CALL => per_call /= 2,
+            Err(s) => return Err(status(server)(s)),
+        }
+    }
+    Ok(blocks)
+}
+
+/// tonic's own timeout, the server's deadline, or tor_module's.
+fn out_of_time(s: &tonic::Status) -> bool {
+    matches!(s.code(), tonic::Code::Cancelled | tonic::Code::DeadlineExceeded)
+        || (s.code() == tonic::Code::Unavailable && s.message().starts_with("no answer within"))
+}
+
 /// A grid chunk: the tree state just below `start`, and blocks start..=last.
 pub struct Chunk {
     pub start: u32,
@@ -39,13 +80,7 @@ pub struct Chunk {
 pub async fn fetch_chunk(server: &str, proxy: &ProxyAddr, start: u32, last: u32) -> Result<Chunk, NetError> {
     let first = super::cache::chunk_first(start);
     let mut c = connect(server, proxy, Isolation::fresh()).await?;
-    let range = BlockRange {
-        start: Some(BlockId { height: first as u64, hash: vec![] }),
-        end: Some(BlockId { height: last as u64, hash: vec![] }),
-        pool_types: ALL_POOLS.iter().map(|p| *p as i32).collect(),
-    };
-    let blocks: Vec<CompactBlock> =
-        c.get_block_range(range).await.map_err(status(server))?.into_inner().try_collect().await.map_err(status(server))?;
+    let blocks = block_range(&mut c, server, first, last).await?;
     // Genesis holds no notes and lightwalletd cannot serve its tree state, so below block 1
     // is the empty tree under the hash block 1 points to. The blocks are checked against it.
     let below = if first == 1 {
@@ -61,12 +96,7 @@ pub async fn fetch_chunk(server: &str, proxy: &ProxyAddr, start: u32, last: u32)
 /// Blocks first..=last on a fresh circuit, for the growing tip chunk.
 pub async fn fetch_blocks(server: &str, proxy: &ProxyAddr, first: u32, last: u32) -> Result<Vec<CompactBlock>, NetError> {
     let mut c = connect(server, proxy, Isolation::fresh()).await?;
-    let range = BlockRange {
-        start: Some(BlockId { height: first as u64, hash: vec![] }),
-        end: Some(BlockId { height: last as u64, hash: vec![] }),
-        pool_types: ALL_POOLS.iter().map(|p| *p as i32).collect(),
-    };
-    c.get_block_range(range).await.map_err(status(server))?.into_inner().try_collect().await.map_err(status(server))
+    block_range(&mut c, server, first, last).await
 }
 
 pub async fn tip_and_info(server: &str, proxy: &ProxyAddr, iso: Isolation) -> Result<(u32, LightdInfo), NetError> {

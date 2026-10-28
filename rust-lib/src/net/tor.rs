@@ -180,8 +180,9 @@ mod tests {
     use super::*;
     use prost::Message;
     use serde_json::json;
+    use zcash_client_backend::proto::compact_formats::CompactBlock;
     use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
-    use zcash_client_backend::proto::service::{BlockId, ChainSpec, LightdInfo};
+    use zcash_client_backend::proto::service::{BlockId, BlockRange, ChainSpec, LightdInfo};
 
     fn frame(msg: &impl Message) -> Vec<u8> {
         let b = msg.encode_to_vec();
@@ -191,9 +192,10 @@ mod tests {
         out
     }
 
-    /// Answers as tor_module would, and records each URL, key and budget.
+    /// Answers as tor_module would, and records each URL, key and budget. A block range longer
+    /// than the second field runs out of time.
     #[derive(Default)]
-    struct Fake(std::sync::Mutex<Vec<(String, String, Option<Duration>)>>);
+    struct Fake(std::sync::Mutex<Vec<(String, String, Option<Duration>)>>, Option<u64>);
 
     impl Fake {
         fn budgets(&self) -> Vec<Option<Duration>> {
@@ -213,6 +215,14 @@ mod tests {
                 done(frame(&BlockId { height: 4242, hash: vec![7; 32] }))
             } else if url.ends_with("/GetLightdInfo") {
                 done(frame(&LightdInfo { chain_name: "test".into(), block_height: 4242, ..Default::default() }))
+            } else if url.ends_with("/GetBlockRange") && !url.contains("down.example") {
+                let range = BlockRange::decode(&body[5..]).unwrap();
+                let (from, to) = (range.start.unwrap().height, range.end.unwrap().height);
+                if self.1.is_some_and(|longest| to + 1 - from > longest) {
+                    json!({ "state": "failed", "error": "no answer within 600 s" })
+                } else {
+                    done((from..=to).flat_map(|height| frame(&CompactBlock { height, ..Default::default() })).collect())
+                }
             } else {
                 json!({ "state": "failed", "error": "Tor is not running" })
             };
@@ -252,6 +262,40 @@ mod tests {
         let (tip, info) = crate::sync::fetch::tip_and_info("https://zec.rocks:443", &tor, iso).await.unwrap();
         assert_eq!((tip, info.chain_name.as_str()), (4242, "test"));
         assert_eq!(fake.budgets(), [Some(crate::sync::fetch::TIP_CALL); 2]);
+    }
+
+    fn client(fake: &Arc<Fake>, url: &str) -> crate::net::client::Client {
+        CompactTxStreamerClient::new(crate::net::client::GrpcChannel::new(TorChannel::new(fake.clone(), url, "k1")))
+    }
+
+    #[tokio::test]
+    async fn a_chunk_comes_50_blocks_a_call_on_one_circuit() {
+        use crate::sync::fetch::{block_range, BLOCKS_CALL};
+        let fake = Arc::new(Fake::default());
+        let mut c = client(&fake, "https://zec.rocks:443/");
+        let blocks = block_range(&mut c, "https://zec.rocks:443", 1_800_001, 1_801_000).await.unwrap();
+        assert!(blocks.iter().map(|b| b.height).eq(1_800_001..=1_801_000));
+        let seen = fake.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 20);
+        assert!(seen.iter().all(|(url, key, budget)| url.ends_with("/GetBlockRange") && key == "k1" && *budget == Some(BLOCKS_CALL)));
+        // The last call takes what is left.
+        assert_eq!(block_range(&mut c, "https://zec.rocks:443", 10, 260).await.unwrap().len(), 251);
+        assert_eq!(fake.0.lock().unwrap().len(), 26);
+    }
+
+    #[tokio::test]
+    async fn a_call_out_of_time_is_made_again_in_halves() {
+        use crate::sync::fetch::block_range;
+        // 50 and 25 blocks run out of time; 12 a call get all 100.
+        let fake = Arc::new(Fake(Default::default(), Some(12)));
+        let blocks = block_range(&mut client(&fake, "https://zec.rocks:443/"), "https://zec.rocks:443", 1, 100).await.unwrap();
+        assert!(blocks.iter().map(|b| b.height).eq(1..=100));
+        assert_eq!(fake.0.lock().unwrap().len(), 2 + 9);
+        // Any other failure ends the range at once.
+        let fake = Arc::new(Fake::default());
+        let e = block_range(&mut client(&fake, "https://down.example:443/"), "https://down.example:443", 1, 100).await.unwrap_err();
+        assert!(e.to_string().contains("Tor is not running"), "{e}");
+        assert_eq!(fake.0.lock().unwrap().len(), 1);
     }
 
     #[test]
