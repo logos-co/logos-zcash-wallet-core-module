@@ -192,10 +192,9 @@ mod tests {
         out
     }
 
-    /// Answers as tor_module would, and records each URL, key and budget. A block range longer
-    /// than the second field runs out of time.
+    /// Answers as tor_module would, and records each URL, key and budget.
     #[derive(Default)]
-    struct Fake(std::sync::Mutex<Vec<(String, String, Option<Duration>)>>, Option<u64>);
+    struct Fake(std::sync::Mutex<Vec<(String, String, Option<Duration>)>>);
 
     impl Fake {
         fn budgets(&self) -> Vec<Option<Duration>> {
@@ -215,14 +214,6 @@ mod tests {
                 done(frame(&BlockId { height: 4242, hash: vec![7; 32] }))
             } else if url.ends_with("/GetLightdInfo") {
                 done(frame(&LightdInfo { chain_name: "test".into(), block_height: 4242, ..Default::default() }))
-            } else if url.ends_with("/GetBlockRange") && !url.contains("down.example") {
-                let range = BlockRange::decode(&body[5..]).unwrap();
-                let (from, to) = (range.start.unwrap().height, range.end.unwrap().height);
-                if self.1.is_some_and(|longest| to + 1 - from > longest) {
-                    json!({ "state": "failed", "error": "no answer within 600 s" })
-                } else {
-                    done((from..=to).flat_map(|height| frame(&CompactBlock { height, ..Default::default() })).collect())
-                }
             } else {
                 json!({ "state": "failed", "error": "Tor is not running" })
             };
@@ -264,38 +255,90 @@ mod tests {
         assert_eq!(fake.budgets(), [Some(crate::sync::fetch::TIP_CALL); 2]);
     }
 
-    fn client(fake: &Arc<Fake>, url: &str) -> crate::net::client::Client {
-        CompactTxStreamerClient::new(crate::net::client::GrpcChannel::new(TorChannel::new(fake.clone(), url, "k1")))
+    type Call = (u64, u64, String, Option<Duration>);
+    type Answer = Box<dyn Fn(u64, u64, &str) -> Option<Value> + Send + Sync>;
+
+    /// GetBlockRange as tor_module would answer it, unless `answer` answers first; records each
+    /// call's range, key and budget.
+    struct Ranges(std::sync::Mutex<Vec<Call>>, Answer);
+
+    impl TorRequests for Ranges {
+        fn grpc(&self, url: &str, body: &[u8], key: &str, budget: Option<Duration>) -> (i32, String, Vec<u8>) {
+            assert!(url.ends_with("/GetBlockRange"), "{url}");
+            let range = BlockRange::decode(&body[5..]).unwrap();
+            let (from, to) = (range.start.unwrap().height, range.end.unwrap().height);
+            self.0.lock().unwrap().push((from, to, key.to_string(), budget));
+            let reply = (self.1)(from, to, key).unwrap_or_else(|| {
+                let blocks: Vec<u8> = (from..=to).flat_map(|height| frame(&CompactBlock { height, ..Default::default() })).collect();
+                let b64 = base64::engine::general_purpose::STANDARD;
+                json!({ "state": "done", "status": 200, "headers": [], "trailers": [["grpc-status", "0"]], "body": b64.encode(blocks) })
+            });
+            grpc_answer(&reply)
+        }
+    }
+
+    fn failed(error: &str) -> Option<Value> {
+        Some(json!({ "state": "failed", "error": error }))
+    }
+
+    /// block_range over `fake` from circuit k1; each fresh circuit is the next key, k2, k3...
+    async fn fetch(fake: &Arc<Ranges>, first: u32, last: u32) -> Result<Vec<CompactBlock>, crate::net::client::NetError> {
+        let client = |key: String| CompactTxStreamerClient::new(crate::net::client::GrpcChannel::new(TorChannel::new(fake.clone(), "https://zec.rocks:443/", &key)));
+        let mut circuits = 1;
+        let reconnect = || {
+            circuits += 1;
+            let c = client(format!("k{circuits}"));
+            async move { Ok(c) }
+        };
+        crate::sync::fetch::block_range(&mut client("k1".into()), reconnect, "https://zec.rocks:443", first, last).await
+    }
+
+    fn calls(fake: &Ranges) -> Vec<(u64, u64, String)> {
+        fake.0.lock().unwrap().iter().map(|(from, to, key, _)| (*from, *to, key.clone())).collect()
     }
 
     #[tokio::test]
     async fn a_chunk_comes_50_blocks_a_call_on_one_circuit() {
-        use crate::sync::fetch::{block_range, BLOCKS_CALL};
-        let fake = Arc::new(Fake::default());
-        let mut c = client(&fake, "https://zec.rocks:443/");
-        let blocks = block_range(&mut c, "https://zec.rocks:443", 1_800_001, 1_801_000).await.unwrap();
+        let fake = Arc::new(Ranges(Default::default(), Box::new(|_, _, _| None)));
+        let blocks = fetch(&fake, 1_800_001, 1_801_000).await.unwrap();
         assert!(blocks.iter().map(|b| b.height).eq(1_800_001..=1_801_000));
         let seen = fake.0.lock().unwrap().clone();
         assert_eq!(seen.len(), 20);
-        assert!(seen.iter().all(|(url, key, budget)| url.ends_with("/GetBlockRange") && key == "k1" && *budget == Some(BLOCKS_CALL)));
+        let budget = Some(crate::sync::fetch::BLOCKS_CALL);
+        assert!(seen.iter().all(|(from, to, key, b)| to - from == 49 && key == "k1" && *b == budget));
         // The last call takes what is left.
-        assert_eq!(block_range(&mut c, "https://zec.rocks:443", 10, 260).await.unwrap().len(), 251);
+        assert_eq!(fetch(&fake, 10, 260).await.unwrap().len(), 251);
         assert_eq!(fake.0.lock().unwrap().len(), 26);
     }
 
     #[tokio::test]
-    async fn a_call_out_of_time_is_made_again_in_halves() {
-        use crate::sync::fetch::block_range;
-        // 50 and 25 blocks run out of time; 12 a call get all 100.
-        let fake = Arc::new(Fake(Default::default(), Some(12)));
-        let blocks = block_range(&mut client(&fake, "https://zec.rocks:443/"), "https://zec.rocks:443", 1, 100).await.unwrap();
-        assert!(blocks.iter().map(|b| b.height).eq(1..=100));
-        assert_eq!(fake.0.lock().unwrap().len(), 2 + 9);
-        // Any other failure ends the range at once.
-        let fake = Arc::new(Fake::default());
-        let e = block_range(&mut client(&fake, "https://down.example:443/"), "https://down.example:443", 1, 100).await.unwrap_err();
+    async fn a_lost_call_is_made_again_on_a_fresh_circuit() {
+        // k1 breaks off at 101, and on k2 50 blocks run out of time: k3 takes the rest 25 a call.
+        let fake = Arc::new(Ranges(
+            Default::default(),
+            Box::new(|from, to, key| match key {
+                "k1" if from == 101 => failed("http: error reading a body from connection"),
+                "k2" if to - from == 49 => failed("no answer within 600 s"),
+                _ => None,
+            }),
+        ));
+        let blocks = fetch(&fake, 1, 200).await.unwrap();
+        assert!(blocks.iter().map(|b| b.height).eq(1..=200));
+        let want = [(1, 50, "k1"), (51, 100, "k1"), (101, 150, "k1"), (101, 150, "k2"), (101, 125, "k3"), (126, 150, "k3"), (151, 175, "k3"), (176, 200, "k3")];
+        assert_eq!(calls(&fake), want.map(|(f, t, k)| (f, t, k.to_string())));
+    }
+
+    #[tokio::test]
+    async fn a_range_gives_up_after_failures_in_a_row_or_on_an_answer() {
+        let fake = Arc::new(Ranges(Default::default(), Box::new(|_, _, _| failed("Tor is not running"))));
+        let e = fetch(&fake, 1, 100).await.unwrap_err();
         assert!(e.to_string().contains("Tor is not running"), "{e}");
-        assert_eq!(fake.0.lock().unwrap().len(), 1);
+        assert_eq!(calls(&fake).len() as u32, 1 + crate::sync::fetch::RETRIES);
+        // The server's own answer, as for a block past its tip, is not tried again.
+        let past_tip = json!({ "state": "done", "status": 200, "headers": [], "trailers": [["grpc-status", "11"], ["grpc-message", "newer than the latest block"]], "body": "" });
+        let fake = Arc::new(Ranges(Default::default(), Box::new(move |_, _, _| Some(past_tip.clone()))));
+        assert!(fetch(&fake, 1, 100).await.is_err());
+        assert_eq!(calls(&fake), [(1, 50, "k1".to_string())]);
     }
 
     #[test]

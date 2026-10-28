@@ -34,11 +34,18 @@ pub const BLOCKS_PER_CALL: u32 = 50;
 const FEWEST_PER_CALL: u32 = 6;
 /// Each call gives up after this, tor_module's longest request.
 pub const BLOCKS_CALL: Duration = Duration::from_secs(600);
+/// A range gives up after this many failed calls in a row.
+pub const RETRIES: u32 = 3;
 
-/// Blocks first..=last on one client, so on one circuit.
-pub(crate) async fn block_range(c: &mut Client, server: &str, first: u32, last: u32) -> Result<Vec<CompactBlock>, NetError> {
+/// Blocks first..=last on one circuit. A call that times out or breaks off is made again on a
+/// fresh one from `reconnect`, in halves if it ran out of time; the blocks already here stay.
+pub(crate) async fn block_range<F, Fut>(c: &mut Client, mut reconnect: F, server: &str, first: u32, last: u32) -> Result<Vec<CompactBlock>, NetError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Client, NetError>>,
+{
     let mut blocks = Vec::new();
-    let (mut from, mut per_call) = (first, BLOCKS_PER_CALL);
+    let (mut from, mut per_call, mut failures) = (first, BLOCKS_PER_CALL, 0);
     while from <= last {
         let to = last.min(from + (per_call - 1));
         let range = BlockRange {
@@ -54,8 +61,16 @@ pub(crate) async fn block_range(c: &mut Client, server: &str, first: u32, last: 
             Ok(part) => {
                 blocks.extend(part);
                 from = to + 1;
+                failures = 0;
             }
-            Err(s) if out_of_time(&s) && per_call > FEWEST_PER_CALL => per_call /= 2,
+            Err(s) if transient(&s) && failures < RETRIES => {
+                failures += 1;
+                if out_of_time(&s) && per_call > FEWEST_PER_CALL {
+                    per_call /= 2;
+                }
+                tracing::warn!(target: "zcash", "blocks {from}..={to}: {}; again on a fresh circuit", s.message());
+                *c = reconnect().await?;
+            }
             Err(s) => return Err(status(server)(s)),
         }
     }
@@ -66,6 +81,11 @@ pub(crate) async fn block_range(c: &mut Client, server: &str, first: u32, last: 
 fn out_of_time(s: &tonic::Status) -> bool {
     matches!(s.code(), tonic::Code::Cancelled | tonic::Code::DeadlineExceeded)
         || (s.code() == tonic::Code::Unavailable && s.message().starts_with("no answer within"))
+}
+
+/// A call lost on the way, not an answer from the server.
+fn transient(s: &tonic::Status) -> bool {
+    out_of_time(s) || s.code() == tonic::Code::Unavailable
 }
 
 /// A grid chunk: the tree state just below `start`, and blocks start..=last.
@@ -80,7 +100,7 @@ pub struct Chunk {
 pub async fn fetch_chunk(server: &str, proxy: &ProxyAddr, start: u32, last: u32) -> Result<Chunk, NetError> {
     let first = super::cache::chunk_first(start);
     let mut c = connect(server, proxy, Isolation::fresh()).await?;
-    let blocks = block_range(&mut c, server, first, last).await?;
+    let blocks = block_range(&mut c, || connect(server, proxy, Isolation::fresh()), server, first, last).await?;
     // Genesis holds no notes and lightwalletd cannot serve its tree state, so below block 1
     // is the empty tree under the hash block 1 points to. The blocks are checked against it.
     let below = if first == 1 {
@@ -96,7 +116,7 @@ pub async fn fetch_chunk(server: &str, proxy: &ProxyAddr, start: u32, last: u32)
 /// Blocks first..=last on a fresh circuit, for the growing tip chunk.
 pub async fn fetch_blocks(server: &str, proxy: &ProxyAddr, first: u32, last: u32) -> Result<Vec<CompactBlock>, NetError> {
     let mut c = connect(server, proxy, Isolation::fresh()).await?;
-    block_range(&mut c, server, first, last).await
+    block_range(&mut c, || connect(server, proxy, Isolation::fresh()), server, first, last).await
 }
 
 pub async fn tip_and_info(server: &str, proxy: &ProxyAddr, iso: Isolation) -> Result<(u32, LightdInfo), NetError> {

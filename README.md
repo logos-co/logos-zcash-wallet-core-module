@@ -31,8 +31,9 @@ which holds the roles; this module holds the keys.
 
   Compact blocks download in 1,000-block chunks from the tip down, one circuit
   per chunk, so the request order says nothing about where the wallet's notes are. A chunk
-  comes 50 blocks a call, fewer if a call runs out of time: one from late 2022's spam is up
-  to ~100 MB, more than one request over Tor can carry. Tree states are fetched only at chunk
+  comes 50 blocks a call: one from late 2022's spam is up to ~100 MB, more than one request
+  over Tor can carry. A call that times out or breaks off is made again on a fresh circuit,
+  in halves if it ran out of time. Tree states are fetched only at chunk
   boundaries; a scan that starts mid-chunk advances the boundary state through cached blocks
   (`sync::frontier`). Each chunk must continue the tree state below it and lead to the one
   above. Scan calls are capped at about 2,000 shielded outputs, so a stop request is honoured
