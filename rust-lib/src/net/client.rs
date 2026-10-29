@@ -10,6 +10,7 @@ use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxS
 
 use super::ipc::{local_node, IpcChannel, TransportError, LOCAL_NODE_URL};
 use super::socks::{Isolation, ProxyAddr, Socks5hConnector};
+use super::tor::TorChannel;
 
 /// A network channel or the local node's IPC, behind one type.
 pub type GrpcChannel =
@@ -32,6 +33,8 @@ pub enum NetError {
     Status { server: String, status: tonic::Status },
     #[error("the local node is not available")]
     NoLocalNode,
+    #[error("the built-in Tor is not available")]
+    NoTor,
     #[error("{0} does not resolve to an address on your network")]
     NotLan(String),
 }
@@ -78,8 +81,9 @@ pub fn is_lan_url(server: &str) -> bool {
 }
 
 /// Opens a TLS channel to `server` (https://host:port), or a plain one to an onion service,
-/// through the proxy, on the circuit `isolation` selects. A server on the user's own network, or
-/// one the proxy bypasses, is dialled directly; `logos://zebrad_module` is the local node over IPC.
+/// through the proxy, on the circuit `isolation` selects: the built-in Tor over IPC, which does
+/// the TLS itself, or the user's own over SOCKS. A server on the user's own network, or one the
+/// proxy bypasses, is dialled directly; `logos://zebrad_module` is the local node over IPC.
 pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> Result<Client, NetError> {
     if server == LOCAL_NODE_URL {
         let call = local_node().ok_or(NetError::NoLocalNode)?;
@@ -115,6 +119,14 @@ pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> R
         let endpoint = Endpoint::from_shared(server.to_string()).map_err(wrap)?.connect_timeout(CONNECT_TIMEOUT);
         let endpoint = endpoint.tls_config(ClientTlsConfig::new().with_webpki_roots().domain_name(host)).map_err(wrap)?;
         return Ok(client(endpoint.connect().await.map_err(wrap)?));
+    }
+    if proxy.is_tor() {
+        if !(uri.scheme_str() == Some("https") || is_onion_url(server)) {
+            return Err(NetError::BadUrl(server.into()));
+        }
+        let tor = super::tor::tor().ok_or(NetError::NoTor)?;
+        let channel = GrpcChannel::new(TorChannel::new(tor, server, &isolation.key()));
+        return Ok(CompactTxStreamerClient::new(channel).max_decoding_message_size(16 * 1024 * 1024));
     }
     let endpoint = Endpoint::from_shared(server.to_string()).map_err(wrap)?.connect_timeout(CONNECT_TIMEOUT);
     let endpoint = match uri.scheme_str() {

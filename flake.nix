@@ -8,6 +8,11 @@
       url = "github:logos-co/logos-zebrad-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
+    # The built-in Tor, reached with requests over IPC.
+    tor_module = {
+      url = "github:logos-co/logos-tor-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

@@ -18,8 +18,11 @@ which holds the roles; this module holds the keys.
   `zcash_client_sqlite` migrations the database lacks, so a wallet made by an older build
   is brought up to date; a migration that needs the seed unseals it with the password
   given to open.
-- **Sync over Tor.** Every call goes through a `socks5h://` proxy; SOCKS credentials pick
-  the circuit. Two exceptions, both reached directly:
+- **Sync over Tor.** Every call goes through Tor: the Tor that comes with Logos
+  (`tor_module`), reached over Logos IPC, where each gRPC call is one HTTP/2 request it makes
+  and TLS is its job; or the user's own, through a `socks5h://` proxy. Either way each client
+  takes its own circuit (an isolation key, or SOCKS credentials). Two exceptions, both
+  reached directly:
   - servers on the user's own network, which Tor cannot reach: private, loopback, CGNAT and
     link-local addresses, or `.local`, `.lan`, `.home.arpa` and `.internal` names that resolve
     only to such addresses;
@@ -27,11 +30,15 @@ which holds the roles; this module holds the keys.
     service is always reached through Tor.
 
   Compact blocks download in 1,000-block chunks from the tip down, one circuit
-  per chunk, so the request order says nothing about where the wallet's notes are. Tree
-  states are fetched only at chunk boundaries; a scan that starts mid-chunk advances the
-  boundary state through cached blocks (`sync::frontier`). Each chunk must continue the tree
-  state below it and lead to the one above. Scan calls are capped at about 2,000 shielded
-  outputs, so a stop request is honoured within a second.
+  per chunk, so the request order says nothing about where the wallet's notes are. A chunk
+  comes 50 blocks a call: one from late 2022's spam is up to ~100 MB, more than one request
+  over Tor can carry. A call that times out or breaks off is made again on a fresh circuit,
+  in halves if it ran out of time. Tree states are fetched only at chunk
+  boundaries; a scan that starts mid-chunk advances the boundary state through cached blocks
+  (`sync::frontier`). Each chunk must continue the tree state below it and lead to the one
+  above. Scan calls are capped at about 2,000 shielded outputs, so a stop request is honoured
+  within a second. The tip is polled every 30 s, and each of a poll's calls gives up after
+  60 s.
 - **Restore without a lookup.** Restores start from a bundled checkpoint
   (`checkpoints/*.json`, every 10,000 blocks; mainnet entries agree across two operators),
   so no server learns the birthday. `examples/checkpoints.rs` rebuilds them.
@@ -59,7 +66,8 @@ Every structured value is a JSON string: `{ "ok": true, ... }` or `{ "ok": false
 Events: `wallet_state_changed`, `sync_progress`, `balance_changed`, `job_finished`.
 
 Job parameters carry the route table the backend got from `zcash_node_module`:
-`{ "routes": { "proxy": "socks5h://127.0.0.1:9050", "servers": ["https://..."], "direct": ["https://..."] } }`.
+`{ "routes": { "proxy": "tor", "servers": ["https://..."], "direct": ["https://..."] } }`.
+The proxy is `tor` for the built-in Tor, or the user's own as `socks5h://host:port`.
 `direct`, optional, lists the servers to reach without Tor. When nothing goes through Tor, the
 proxy may be `"direct"`, which means none.
 
