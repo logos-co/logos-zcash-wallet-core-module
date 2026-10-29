@@ -9733,11 +9733,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1793125142,
-        "narHash": "sha256-6wCWOY89POswB9derweSl8b3vVbm681F58MjItO7Yt4=",
+        "lastModified": 1793233167,
+        "narHash": "sha256-PTDOQMk3JS8snEErsGS2cW6l+DspDoQt/G219Z/pnWg=",
         "owner": "logos-co",
         "repo": "logos-tor-module",
-        "rev": "507251e17d56d8e86539cb5d614cb8b593464209",
+        "rev": "6fba1edd753758930ce0cbc9a854be7863fd35e0",
         "type": "github"
       },
       "original": {
