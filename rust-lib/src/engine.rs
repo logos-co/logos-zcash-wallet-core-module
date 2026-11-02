@@ -3,7 +3,7 @@
 //! The sync thread owns the writer connection. Reads use a second connection, so a
 //! scan in progress never delays a balance or an address.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -21,6 +21,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::jobs::{JobState, Jobs};
 use crate::keys::Phrase;
+use crate::net::client::CallClass;
 use crate::net::ipc::LOCAL_NODE_URL;
 use crate::net::socks::ProxyAddr;
 use crate::network::ZNetwork;
@@ -50,6 +51,18 @@ pub struct Routes {
     /// Servers the user chose to reach without Tor. Each must be https.
     #[serde(default)]
     pub direct: Vec<String>,
+    /// Classes reached without Tor, onion services excepted: `sync` and `tip` at most, with Tor
+    /// for what identifies you. Lookups and sends never go direct this way.
+    #[serde(default, rename = "directFor")]
+    pub direct_for: Vec<CallClass>,
+    /// Where transactions are looked up by txid and by transparent address, if not the sync servers.
+    #[serde(default)]
+    pub details: Option<Vec<String>>,
+    #[serde(default)]
+    pub taddr: Option<Vec<String>>,
+    /// Each server's operator, so the lookups can go to another one than the direct sync.
+    #[serde(default)]
+    pub operators: BTreeMap<String, String>,
 }
 
 impl Routes {
@@ -58,8 +71,14 @@ impl Routes {
         if self.servers.is_empty() {
             return Err("no servers".into());
         }
+        if let Some(c) = self.direct_for.iter().find(|c| !matches!(c, CallClass::Sync | CallClass::Tip)) {
+            return Err(format!("{c:?} calls name the wallet and never go direct"));
+        }
         let broadcast = self.broadcast.clone().unwrap_or_else(|| self.servers.clone());
-        let remote: Vec<&String> = self.servers.iter().chain(&broadcast).filter(|s| *s != LOCAL_NODE_URL).collect();
+        let details = self.details.clone().unwrap_or_else(|| self.servers.clone());
+        let taddr = self.taddr.clone().unwrap_or_else(|| self.servers.clone());
+        let remote: Vec<&String> =
+            self.servers.iter().chain(&broadcast).chain(&details).chain(&taddr).filter(|s| *s != LOCAL_NODE_URL).collect();
         if let Some(bad) = remote.iter().find(|s| !(is_lan_url(s) || s.starts_with("https://") || is_onion_url(s))) {
             return Err(format!("{bad}: servers must be https:// URLs, http:// onion services, or on your own network"));
         }
@@ -72,7 +91,9 @@ impl Routes {
             None => ProxyAddr::direct(),
             Some(s) => ProxyAddr::parse(&self.proxy).map_err(|e| format!("{s} goes through Tor: {e}"))?,
         };
-        let mut cfg = SyncConfig::new(proxy.bypassing(self.direct.iter().cloned()), self.servers.clone());
+        let proxy = proxy.bypassing(self.direct.iter().cloned()).direct_for(self.direct_for.iter().copied());
+        let mut cfg = SyncConfig::new(proxy, self.servers.clone());
+        (cfg.details, cfg.taddr) = (details.clone(), taddr.clone());
         // Tips come from the first server. The local node answers in memory and a LAN server is
         // close, so polling them often costs nothing.
         if self.servers[0] == LOCAL_NODE_URL || is_lan_url(&self.servers[0]) {
@@ -83,7 +104,37 @@ impl Routes {
             cfg.tip_poll = Duration::from_secs(2);
         }
         cfg.broadcast = broadcast;
+        if cfg.proxy.splits() {
+            self.split_operators(&mut cfg);
+        }
         Ok(cfg)
+    }
+
+    /// With sync direct from a third party, one operator could see this IP download a block and
+    /// a Tor user look up a transaction in it. With a second operator, sync stays with the first
+    /// server's, lookups go to the others, and sends try the others first.
+    fn split_operators(&self, cfg: &mut SyncConfig) {
+        use crate::net::client::is_lan_url;
+        let first = &cfg.servers[0];
+        if first == LOCAL_NODE_URL || is_lan_url(first) {
+            return;
+        }
+        let op = |url: &String| self.operators.get(url).unwrap_or(url).to_ascii_lowercase();
+        let syncing = op(first);
+        let elsewhere = |list: &[String]| -> Vec<String> { list.iter().filter(|u| op(u) != syncing).cloned().collect() };
+        let (details, taddr, broadcast) = (elsewhere(&cfg.details), elsewhere(&cfg.taddr), elsewhere(&cfg.broadcast));
+        if details.is_empty() && taddr.is_empty() && broadcast.is_empty() {
+            return;
+        }
+        cfg.servers.retain(|u| op(u) == syncing);
+        if !details.is_empty() {
+            cfg.details = details;
+        }
+        if !taddr.is_empty() {
+            cfg.taddr = taddr;
+        }
+        let rest: Vec<String> = cfg.broadcast.iter().filter(|u| op(u) == syncing).cloned().collect();
+        cfg.broadcast = broadcast.into_iter().chain(rest).collect();
     }
 }
 
@@ -1018,7 +1069,69 @@ mod tests {
             servers: servers.iter().map(|s| s.to_string()).collect(),
             broadcast: (!broadcast.is_empty()).then(|| broadcast.iter().map(|s| s.to_string()).collect()),
             direct: vec![],
+            direct_for: vec![],
+            details: None,
+            taddr: None,
+            operators: BTreeMap::new(),
         }
+    }
+
+    /// The node module's identifying routes for two operators, as the backend passes them.
+    fn identifying(proxy: &str) -> Routes {
+        serde_json::from_value(json!({
+            "proxy": proxy,
+            "servers": ["https://zec.rocks:443", "https://us.zec.stardust.rest:443"],
+            "broadcast": ["https://zec.rocks:443", "https://us.zec.stardust.rest:443"],
+            "details": ["https://zec.rocks:443", "https://na.zec.rocks:443", "https://us.zec.stardust.rest:443"],
+            "taddr": ["https://zec.rocks:443", "https://us.zec.stardust.rest:443"],
+            "directFor": ["sync", "tip"],
+            "operators": {"https://zec.rocks:443": "zec.rocks", "https://na.zec.rocks:443": "zec.rocks",
+                          "https://us.zec.stardust.rest:443": "Stardust"},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn identifying_syncs_from_one_operator_and_looks_up_at_the_other() {
+        use crate::net::client::{path, Path};
+        let cfg = identifying("tor").config().unwrap();
+        let (rocks, stardust) = ("https://zec.rocks:443", "https://us.zec.stardust.rest:443");
+        assert_eq!((cfg.servers.clone(), cfg.details.clone(), cfg.taddr.clone()), (vec![rocks.to_string()], vec![stardust.to_string()], vec![stardust.to_string()]));
+        assert_eq!(cfg.broadcast, [stardust, rocks]);
+        assert_eq!((path(rocks, &cfg.proxy, CallClass::Sync), path(rocks, &cfg.proxy, CallClass::Tip)), (Path::Direct, Path::Direct));
+        for class in [CallClass::Details, CallClass::Taddr, CallClass::Broadcast] {
+            assert_eq!(path(stardust, &cfg.proxy, class), Path::Tor, "{class:?}");
+            assert_eq!(path(rocks, &cfg.proxy, class), Path::Tor, "{class:?}");
+        }
+        // One operator: nothing to split, and the copy says that server sees both sides.
+        let mut one = identifying("tor");
+        one.servers.truncate(1);
+        one.operators.insert("https://us.zec.stardust.rest:443".into(), "zec.rocks".into());
+        let cfg = one.config().unwrap();
+        assert_eq!((cfg.servers.len(), cfg.details.len(), cfg.broadcast.len()), (1, 3, 2));
+        // Without operators each url is its own, so lookups still avoid the sync server.
+        let mut bare = identifying("tor");
+        bare.operators.clear();
+        assert!(!bare.config().unwrap().details.contains(&rocks.to_string()));
+        // A sync from the user's own server, or the local node, keeps every lookup there.
+        let mut own = identifying("tor");
+        own.servers.insert(0, "http://192.168.1.20:9067".into());
+        own.details.as_mut().unwrap().insert(0, "http://192.168.1.20:9067".into());
+        assert_eq!(own.config().unwrap().details.len(), 4);
+        let mut local = identifying("tor");
+        (local.servers, local.details, local.taddr) = (vec![LOCAL_NODE_URL.into()], Some(vec![LOCAL_NODE_URL.into()]), Some(vec![LOCAL_NODE_URL.into()]));
+        let cfg = local.config().unwrap();
+        assert_eq!((cfg.servers[0].as_str(), cfg.details[0].as_str(), cfg.taddr[0].as_str()), (LOCAL_NODE_URL, LOCAL_NODE_URL, LOCAL_NODE_URL));
+        assert_eq!(path(rocks, &cfg.proxy, CallClass::Tip), Path::Direct, "the cross-check");
+        // Identifying calls still need a Tor, and never go direct by directFor.
+        assert!(identifying("direct").config().is_err());
+        let mut wrong = identifying("tor");
+        wrong.direct_for.push(CallClass::Broadcast);
+        assert!(wrong.config().unwrap_err().contains("never go direct"));
+        // The old shape still means everything through Tor.
+        let cfg = routes("tor", &[rocks, stardust], &[]).config().unwrap();
+        assert!(!cfg.proxy.splits() && cfg.servers.len() == 2 && cfg.details == cfg.servers);
+        assert_eq!(path(rocks, &cfg.proxy, CallClass::Sync), Path::Tor);
     }
 
     #[test]

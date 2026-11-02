@@ -4,6 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use http::Uri;
+use serde::Deserialize;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tower::ServiceExt;
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
@@ -40,6 +41,84 @@ pub enum NetError {
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// What a call asks a server for, as the node module's route table names it. With Tor for what
+/// identifies you, `sync` and `tip` go direct and the rest name the wallet, so go through Tor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallClass {
+    /// Compact blocks, tree states and subtree roots.
+    Sync,
+    /// Tips and server info, and the local node's cross-check.
+    Tip,
+    /// GetTransaction by txid.
+    Details,
+    /// Transactions by transparent address.
+    Taddr,
+    /// SendTransaction, and asking another operator whether it has the transaction.
+    Broadcast,
+    Mempool,
+}
+
+/// How a call reaches its server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Path {
+    Local,
+    Lan,
+    Direct,
+    /// The built-in Tor, over IPC.
+    Tor,
+    Socks,
+}
+
+/// The path for a `class` call to `server`. An onion service takes Tor whatever the class.
+pub fn path(server: &str, proxy: &ProxyAddr, class: CallClass) -> Path {
+    if server == LOCAL_NODE_URL {
+        Path::Local
+    } else if is_lan_url(server) {
+        Path::Lan
+    } else if proxy.is_direct() || proxy.bypasses(server) || (proxy.dials_directly(class) && !is_onion_url(server)) {
+        Path::Direct
+    } else if proxy.is_tor() {
+        Path::Tor
+    } else {
+        Path::Socks
+    }
+}
+
+/// Every dial in a unit test, with its class, so a test can say which class a call site takes.
+#[cfg(test)]
+pub(crate) mod dials {
+    use super::CallClass;
+    use std::cell::RefCell;
+
+    thread_local!(static SEEN: RefCell<Vec<(String, CallClass)>> = const { RefCell::new(Vec::new()) });
+
+    pub fn note(server: &str, class: CallClass) {
+        SEEN.with(|s| s.borrow_mut().push((server.into(), class)));
+    }
+
+    pub fn take() -> Vec<(String, CallClass)> {
+        SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+}
+
+/// Test builds only: a direct dial to a mapped host goes to a local plain-HTTP/2 front instead.
+#[cfg(feature = "test-dial")]
+pub mod test_dial {
+    use std::collections::BTreeMap;
+    use std::sync::RwLock;
+
+    static FRONTS: RwLock<BTreeMap<String, String>> = RwLock::new(BTreeMap::new());
+
+    pub fn set(host: &str, front: &str) {
+        FRONTS.write().unwrap().insert(host.into(), front.into());
+    }
+
+    pub fn front(host: &str) -> Option<String> {
+        FRONTS.read().unwrap().get(host).cloned()
+    }
+}
 
 /// A v3 onion service. Tor authenticates and encrypts it end to end, so the wallet reaches it
 /// over plain HTTP/2 through Tor, without TLS.
@@ -82,16 +161,20 @@ pub fn is_lan_url(server: &str) -> bool {
 
 /// Opens a TLS channel to `server` (https://host:port), or a plain one to an onion service,
 /// through the proxy, on the circuit `isolation` selects: the built-in Tor over IPC, which does
-/// the TLS itself, or the user's own over SOCKS. A server on the user's own network, or one the
-/// proxy bypasses, is dialled directly; `logos://zebrad_module` is the local node over IPC.
-pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> Result<Client, NetError> {
-    if server == LOCAL_NODE_URL {
+/// the TLS itself, or the user's own over SOCKS. A server on the user's own network, one the
+/// proxy bypasses, or any but an onion for a class it dials directly, is dialled directly;
+/// `logos://zebrad_module` is the local node over IPC.
+pub async fn connect(server: &str, proxy: &ProxyAddr, class: CallClass, isolation: Isolation) -> Result<Client, NetError> {
+    #[cfg(test)]
+    dials::note(server, class);
+    let path = path(server, proxy, class);
+    if path == Path::Local {
         let call = local_node().ok_or(NetError::NoLocalNode)?;
         let channel = GrpcChannel::new(IpcChannel::new(call));
         return Ok(CompactTxStreamerClient::new(channel).max_decoding_message_size(16 * 1024 * 1024));
     }
     let uri: Uri = server.parse().map_err(|_| NetError::BadUrl(server.into()))?;
-    if is_lan_url(server) {
+    if path == Path::Lan {
         let host = uri.host().unwrap_or_default().trim_start_matches('[').trim_end_matches(']').to_string();
         // A name must resolve onto the user's network, or this connection would bypass Tor.
         if host.parse::<IpAddr>().is_err() {
@@ -111,16 +194,20 @@ pub async fn connect(server: &str, proxy: &ProxyAddr, isolation: Isolation) -> R
     }
     let host = uri.host().ok_or_else(|| NetError::BadUrl(server.into()))?.to_string();
     let wrap = |source| NetError::Connect { server: server.into(), source };
-    if proxy.is_direct() || proxy.bypasses(server) {
+    if path == Path::Direct {
         // Without Tor only https: an onion service needs it, and plain http would be readable.
         if uri.scheme_str() != Some("https") {
             return Err(NetError::BadUrl(server.into()));
+        }
+        #[cfg(feature = "test-dial")]
+        if let Some(front) = test_dial::front(&host) {
+            return Ok(client(Endpoint::from_shared(front).map_err(wrap)?.connect().await.map_err(wrap)?));
         }
         let endpoint = Endpoint::from_shared(server.to_string()).map_err(wrap)?.connect_timeout(CONNECT_TIMEOUT);
         let endpoint = endpoint.tls_config(ClientTlsConfig::new().with_webpki_roots().domain_name(host)).map_err(wrap)?;
         return Ok(client(endpoint.connect().await.map_err(wrap)?));
     }
-    if proxy.is_tor() {
+    if path == Path::Tor {
         if !(uri.scheme_str() == Some("https") || is_onion_url(server)) {
             return Err(NetError::BadUrl(server.into()));
         }
@@ -169,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn a_lan_name_must_resolve_onto_the_lan() {
         let server = "http://this-name-does-not-exist.home.arpa:9067";
-        assert!(matches!(connect(server, &ProxyAddr::direct(), Isolation::fresh()).await, Err(NetError::NotLan(_))));
+        assert!(matches!(connect(server, &ProxyAddr::direct(), CallClass::Sync, Isolation::fresh()).await, Err(NetError::NotLan(_))));
     }
 
     /// Needs a Tor SOCKS port in ZCASH_TEST_TOR, e.g. socks5h://127.0.0.1:19050.
@@ -177,7 +264,7 @@ mod tests {
     #[ignore]
     async fn lightd_info_over_tor() {
         let proxy = ProxyAddr::parse(&std::env::var("ZCASH_TEST_TOR").unwrap()).unwrap();
-        let mut c = connect("https://testnet.zec.rocks:443", &proxy, Isolation::fresh()).await.unwrap();
+        let mut c = connect("https://testnet.zec.rocks:443", &proxy, CallClass::Tip, Isolation::fresh()).await.unwrap();
         let info = c.get_lightd_info(Empty {}).await.unwrap().into_inner();
         println!("{} {} height {} branch {} lightwalletd {}", info.chain_name, info.vendor, info.block_height, info.consensus_branch_id, info.version);
         assert_eq!(info.chain_name, "test");
@@ -189,7 +276,7 @@ mod tests {
     async fn lightd_info_from_an_onion_over_tor() {
         let proxy = ProxyAddr::parse(&std::env::var("ZCASH_TEST_TOR").unwrap()).unwrap();
         let server = std::env::var("ZCASH_TEST_ONION").unwrap();
-        let mut c = connect(&server, &proxy, Isolation::fresh()).await.unwrap();
+        let mut c = connect(&server, &proxy, CallClass::Tip, Isolation::fresh()).await.unwrap();
         let info = c.get_lightd_info(Empty {}).await.unwrap().into_inner();
         println!("{} {} height {} branch {} lightwalletd {}", info.chain_name, info.vendor, info.block_height, info.consensus_branch_id, info.version);
         assert_eq!(info.chain_name, "test");
@@ -217,9 +304,30 @@ mod tests {
     #[tokio::test]
     async fn an_onion_needs_tor() {
         let server = format!("http://{}.onion:9067", "a2".repeat(28));
-        assert!(matches!(connect(&server, &ProxyAddr::direct(), Isolation::fresh()).await, Err(NetError::BadUrl(_))));
+        assert!(matches!(connect(&server, &ProxyAddr::direct(), CallClass::Sync, Isolation::fresh()).await, Err(NetError::BadUrl(_))));
         // Even when the proxy is told to go around it.
         let tor = ProxyAddr::parse("socks5h://127.0.0.1:9").unwrap().bypassing([server.clone()]);
-        assert!(matches!(connect(&server, &tor, Isolation::fresh()).await, Err(NetError::BadUrl(_))));
+        assert!(matches!(connect(&server, &tor, CallClass::Sync, Isolation::fresh()).await, Err(NetError::BadUrl(_))));
+    }
+
+    #[test]
+    fn classes_choose_the_path_with_tor_for_what_identifies_you() {
+        let (rocks, onion, lan) = ("https://zec.rocks:443", format!("http://{}.onion:9067", "a2".repeat(28)), "http://192.168.1.10:9067");
+        let split = ProxyAddr::tor().direct_for([CallClass::Sync, CallClass::Tip]);
+        for class in [CallClass::Sync, CallClass::Tip] {
+            assert_eq!(path(rocks, &split, class), Path::Direct, "{class:?}");
+            assert_eq!(path(&onion, &split, class), Path::Tor, "an onion service takes Tor for {class:?}");
+        }
+        for class in [CallClass::Details, CallClass::Taddr, CallClass::Broadcast, CallClass::Mempool] {
+            assert_eq!(path(rocks, &split, class), Path::Tor, "{class:?}");
+            assert_eq!(path(lan, &split, class), Path::Lan, "{class:?}");
+        }
+        assert_eq!(path(LOCAL_NODE_URL, &split, CallClass::Details), Path::Local);
+        let own = ProxyAddr::parse("socks5h://127.0.0.1:9050").unwrap().direct_for([CallClass::Sync]);
+        assert_eq!((path(rocks, &own, CallClass::Sync), path(rocks, &own, CallClass::Tip)), (Path::Direct, Path::Socks));
+        // Without directFor, every class goes through Tor, as before.
+        for class in [CallClass::Sync, CallClass::Tip, CallClass::Details] {
+            assert_eq!(path(rocks, &ProxyAddr::tor(), class), Path::Tor);
+        }
     }
 }

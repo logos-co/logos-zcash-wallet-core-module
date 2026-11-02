@@ -83,6 +83,8 @@ tempfile = "3"
 [features]
 default = ["logos_module"]
 logos_module = ["dep:logos-rust-sdk"]
+# tests/tor_use.rs: direct dials to mapped hosts reach local counting fronts.
+test-dial = []
 
 [profile.release]
 panic = "unwind"

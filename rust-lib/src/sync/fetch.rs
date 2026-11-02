@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
-use zcash_client_backend::proto::service::{BlockId, BlockRange, ChainSpec, Empty, LightdInfo, PoolType, TreeState};
+use zcash_client_backend::proto::service::{BlockId, BlockRange, ChainSpec, Empty, GetSubtreeRootsArg, LightdInfo, PoolType, SubtreeRoot, TreeState};
 
-use crate::net::client::{connect, Client, NetError};
+use crate::net::client::{connect, CallClass, Client, NetError};
 use crate::net::socks::{Isolation, ProxyAddr};
 
 pub const ALL_POOLS: [PoolType; 4] = [PoolType::Transparent, PoolType::Sapling, PoolType::Orchard, PoolType::Ironwood];
@@ -99,8 +99,8 @@ pub struct Chunk {
 
 pub async fn fetch_chunk(server: &str, proxy: &ProxyAddr, start: u32, last: u32) -> Result<Chunk, NetError> {
     let first = super::cache::chunk_first(start);
-    let mut c = connect(server, proxy, Isolation::fresh()).await?;
-    let blocks = block_range(&mut c, || connect(server, proxy, Isolation::fresh()), server, first, last).await?;
+    let mut c = connect(server, proxy, CallClass::Sync, Isolation::fresh()).await?;
+    let blocks = block_range(&mut c, || connect(server, proxy, CallClass::Sync, Isolation::fresh()), server, first, last).await?;
     // Genesis holds no notes and lightwalletd cannot serve its tree state, so below block 1
     // is the empty tree under the hash block 1 points to. The blocks are checked against it.
     let below = if first == 1 {
@@ -115,26 +115,26 @@ pub async fn fetch_chunk(server: &str, proxy: &ProxyAddr, start: u32, last: u32)
 
 /// Blocks first..=last on a fresh circuit, for the growing tip chunk.
 pub async fn fetch_blocks(server: &str, proxy: &ProxyAddr, first: u32, last: u32) -> Result<Vec<CompactBlock>, NetError> {
-    let mut c = connect(server, proxy, Isolation::fresh()).await?;
-    block_range(&mut c, || connect(server, proxy, Isolation::fresh()), server, first, last).await
+    let mut c = connect(server, proxy, CallClass::Sync, Isolation::fresh()).await?;
+    block_range(&mut c, || connect(server, proxy, CallClass::Sync, Isolation::fresh()), server, first, last).await
 }
 
 pub async fn tip_and_info(server: &str, proxy: &ProxyAddr, iso: Isolation) -> Result<(u32, LightdInfo), NetError> {
-    let mut c = connect(server, proxy, iso).await?;
+    let mut c = connect(server, proxy, CallClass::Tip, iso).await?;
     let info = c.get_lightd_info(within(Empty {}, TIP_CALL)).await.map_err(status(server))?.into_inner();
     let tip = c.get_latest_block(within(ChainSpec {}, TIP_CALL)).await.map_err(status(server))?.into_inner().height as u32;
     Ok((tip, info))
 }
 
 pub async fn tree_state(server: &str, proxy: &ProxyAddr, height: u32) -> Result<TreeState, NetError> {
-    let mut c = connect(server, proxy, Isolation::fresh()).await?;
+    let mut c = connect(server, proxy, CallClass::Sync, Isolation::fresh()).await?;
     Ok(c.get_tree_state(BlockId { height: height as u64, hash: vec![] }).await.map_err(status(server))?.into_inner())
 }
 
 /// Broadcasts on a fresh circuit. Returns lightwalletd's error code and message;
 /// code 0 means the node accepted it.
 pub async fn send_transaction(server: &str, proxy: &ProxyAddr, raw: Vec<u8>) -> Result<(i32, String), NetError> {
-    let mut c = connect(server, proxy, Isolation::fresh()).await?;
+    let mut c = connect(server, proxy, CallClass::Broadcast, Isolation::fresh()).await?;
     let r = c
         .send_transaction(zcash_client_backend::proto::service::RawTransaction { data: raw, height: 0 })
         .await
@@ -144,14 +144,22 @@ pub async fn send_transaction(server: &str, proxy: &ProxyAddr, raw: Vec<u8>) -> 
 }
 
 /// Whether `server` knows the transaction, mined or in its mempool, asked on a fresh circuit.
+/// It names the send, so it travels as one.
 pub async fn knows_transaction(server: &str, proxy: &ProxyAddr, txid: &[u8]) -> Result<bool, NetError> {
-    let mut c = connect(server, proxy, Isolation::fresh()).await?;
+    let mut c = connect(server, proxy, CallClass::Broadcast, Isolation::fresh()).await?;
     let filter = zcash_client_backend::proto::service::TxFilter { block: None, index: 0, hash: txid.to_vec() };
     match c.get_transaction(filter).await {
         Ok(_) => Ok(true),
         Err(s) if s.code() == tonic::Code::NotFound => Ok(false),
         Err(s) => Err(NetError::Status { server: server.into(), status: s }),
     }
+}
+
+/// The subtree roots of one pool from `start`, on a fresh circuit.
+pub async fn subtree_roots(server: &str, proxy: &ProxyAddr, pool: i32, start: u32) -> Result<Vec<SubtreeRoot>, NetError> {
+    let mut c = connect(server, proxy, CallClass::Sync, Isolation::fresh()).await?;
+    let arg = GetSubtreeRootsArg { start_index: start, shielded_protocol: pool, max_entries: 0 };
+    c.get_subtree_roots(arg).await.map_err(status(server))?.into_inner().try_collect().await.map_err(status(server))
 }
 
 /// After one operator accepted a transaction, the other must know it within two minutes,

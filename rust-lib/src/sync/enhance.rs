@@ -12,7 +12,7 @@ use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::TxId;
 
-use crate::net::client::{connect, Client, NetError};
+use crate::net::client::{connect, CallClass, Client, NetError};
 use crate::net::socks::{Isolation, ProxyAddr};
 use crate::network::ZNetwork;
 
@@ -24,9 +24,25 @@ pub enum Fetched {
 
 /// Spreads requests out; the largest delay is short enough to stay responsive.
 pub const MAX_DELAY: Duration = Duration::from_secs(20);
+/// More on top while sync goes direct: a lookup soon after a direct download is easier to match.
+pub const MAX_JITTER: Duration = Duration::from_secs(60);
 
 pub fn random_delay() -> Duration {
     Duration::from_millis(rand::rng().random_range(0..MAX_DELAY.as_millis() as u64))
+}
+
+/// The wait before a lookup: the usual spacing, plus jitter when sync goes direct.
+pub fn delay(split: bool) -> Duration {
+    let jitter = if split { Duration::from_millis(rand::rng().random_range(0..MAX_JITTER.as_millis() as u64)) } else { Duration::ZERO };
+    random_delay() + jitter
+}
+
+/// The class a request travels as.
+pub fn class(req: &TransactionDataRequest) -> CallClass {
+    match req {
+        TransactionDataRequest::TransactionsInvolvingAddress(_) => CallClass::Taddr,
+        _ => CallClass::Details,
+    }
 }
 
 pub fn pick<'a>(servers: &'a [String]) -> &'a str {
@@ -57,7 +73,7 @@ pub async fn fetch(
 ) -> Result<Fetched, NetError> {
     let status = |status| NetError::Status { server: server.into(), status };
     let bad = |detail: String| NetError::Status { server: server.into(), status: tonic::Status::data_loss(detail) };
-    let mut c = connect(server, proxy, Isolation::fresh()).await?;
+    let mut c = connect(server, proxy, class(req), Isolation::fresh()).await?;
     match req {
         TransactionDataRequest::GetStatus(txid) | TransactionDataRequest::Enhancement(txid) => {
             let filter = TxFilter { block: None, index: 0, hash: txid.as_ref().to_vec() };
@@ -96,7 +112,7 @@ pub async fn received(
     end: u32,
     tip: u32,
 ) -> Result<Vec<(Transaction, Option<BlockHeight>)>, NetError> {
-    let mut c = connect(server, proxy, Isolation::fresh()).await?;
+    let mut c = connect(server, proxy, CallClass::Taddr, Isolation::fresh()).await?;
     address_txs(&mut c, params, server, address, start, end, tip).await
 }
 

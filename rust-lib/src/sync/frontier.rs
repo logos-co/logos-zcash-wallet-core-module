@@ -90,7 +90,7 @@ mod tests {
     #[ignore]
     async fn advance_matches_server_tree_state() {
         let proxy = ProxyAddr::parse(&std::env::var("ZCASH_TEST_TOR").unwrap()).unwrap();
-        let mut c = connect("https://testnet.zec.rocks:443", &proxy, Isolation::fresh()).await.unwrap();
+        let mut c = connect("https://testnet.zec.rocks:443", &proxy, crate::net::client::CallClass::Sync, Isolation::fresh()).await.unwrap();
         let (from, to) = (4_470_999u64, 4_471_350u64);
         let start = c.get_tree_state(BlockId { height: from, hash: vec![] }).await.unwrap().into_inner();
         let end = c.get_tree_state(BlockId { height: to, hash: vec![] }).await.unwrap().into_inner();

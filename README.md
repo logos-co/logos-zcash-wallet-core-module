@@ -18,7 +18,7 @@ which holds the roles; this module holds the keys.
   `zcash_client_sqlite` migrations the database lacks, so a wallet made by an older build
   is brought up to date; a migration that needs the seed unseals it with the password
   given to open.
-- **Sync over Tor.** Every call goes through Tor: the Tor that comes with Logos
+- **Sync over Tor.** Every call goes through Tor unless the routes say otherwise: the Tor that comes with Logos
   (`tor_module`), reached over Logos IPC, where each gRPC call is one HTTP/2 request it makes
   and TLS is its job; or the user's own, through a `socks5h://` proxy. Either way each client
   takes its own circuit (an isolation key, or SOCKS credentials). Two exceptions, both
@@ -39,6 +39,17 @@ which holds the roles; this module holds the keys.
   above. Scan calls are capped at about 2,000 shielded outputs, so a stop request is honoured
   within a second. The tip is polled every 30 s, and each of a poll's calls gives up after
   60 s.
+- **Use Tor for what identifies you.** Each call has a class: `sync` (compact blocks, tree
+  states, subtree roots), `tip` (tips, server info, the local node's cross-check), `details`
+  (a transaction by txid), `taddr` (transactions by transparent address), `broadcast` (sends,
+  and asking another operator whether it has one) and `mempool`. The classes in the routes'
+  `directFor` (`sync` and `tip`, never more) dial directly, onion services excepted; the rest
+  take the proxy. With another operator in the routes, sync and tips stay with the first
+  server's operator, `details` and `taddr` lookups go to the others, and sends try the others
+  first, so the operator that sees this IP download blocks never sees what the wallet looks
+  up. Each lookup then also waits up to 60 s more, on top of the usual 0-20 s, so its timing
+  is harder to match to a direct download. The local node keeps all of this as before: it
+  serves every read itself.
 - **Restore without a lookup.** Restores start from a bundled checkpoint
   (`checkpoints/*.json`, every 10,000 blocks; mainnet entries agree across two operators),
   so no server learns the birthday. `examples/checkpoints.rs` rebuilds them.
@@ -70,6 +81,11 @@ Job parameters carry the route table the backend got from `zcash_node_module`:
 The proxy is `tor` for the built-in Tor, or the user's own as `socks5h://host:port`.
 `direct`, optional, lists the servers to reach without Tor. When nothing goes through Tor, the
 proxy may be `"direct"`, which means none.
+
+With Tor for what identifies you, the routes also carry `directFor: ["sync", "tip"]`, where
+lookups go (`details`, `taddr`; the sync servers when absent) and each server's operator
+(`operators`, url to name). Any other class in `directFor` is refused. A core older than this
+ignores the four fields and keeps every call on the proxy.
 
 ## Development
 
@@ -127,6 +143,19 @@ transparent address, which it must report as uneconomic: worth less than spendin
 cost. It shields the transparent coinbase and runs the ZIP 318 migration of the Orchard
 coinbase to the end. Mining to a transparent address
 (`chain.sh start <taddr>`) is fastest while the migration waits on its schedule.
+
+`tests/tor_use.rs` checks where each class goes on the same chain. It puts two operators,
+`https://lwd-a.test` and `https://lwd-b.test`, behind counting fronts (the `test-dial` feature,
+off in every build but this test's, dials them in plain HTTP/2), with stand-ins for tor_module
+and the local node. With Tor for what identifies you, no lookup or send goes direct, and the
+second operator sees nothing direct; with Tor for nothing, tor_module is never called; with the
+local node, every read stays on it.
+
+```bash
+REGTEST_HEIGHTS=../tools/regtest/regtest.json REGTEST_PHRASE=phrase.txt \
+REGTEST_RPC=http://127.0.0.1:28232 REGTEST_SERVERS=http://127.0.0.1:29061,http://127.0.0.1:29063 \
+ZCASH_PARAMS_DIR=... cargo test --release --no-default-features --features test-dial --test tor_use -- --ignored --nocapture
+```
 
 `examples/find_payment.rs` trial-decrypts a block range, the mempool or one transaction
 with a viewing key, outside any wallet: it tells "not on chain" from "on chain but missed".
