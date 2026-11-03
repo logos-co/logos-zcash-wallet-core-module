@@ -106,7 +106,7 @@ async fn mempool(net: ZNetwork, ufvk: UnifiedFullViewingKey, server: &str, proxy
         .await
         .unwrap()
         .0;
-    let mut client = zcash_wallet_core::net::client::connect(server, proxy, Isolation::fresh())
+    let mut client = zcash_wallet_core::net::client::connect(server, proxy, zcash_wallet_core::net::client::CallClass::Mempool, Isolation::fresh())
         .await
         .unwrap();
     let txs: Vec<_> = client
@@ -204,7 +204,7 @@ async fn one_tx(
     use zcash_protocol::consensus::{BlockHeight, BranchId};
     let mut hash = hex::decode(txid).expect("hex txid");
     hash.reverse();
-    let mut client = zcash_wallet_core::net::client::connect(server, proxy, Isolation::fresh())
+    let mut client = zcash_wallet_core::net::client::connect(server, proxy, zcash_wallet_core::net::client::CallClass::Details, Isolation::fresh())
         .await
         .unwrap();
     let raw = client

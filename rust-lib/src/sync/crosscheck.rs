@@ -6,7 +6,7 @@ use zcash_client_backend::proto::service::{BlockId, ChainSpec};
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 use super::fetch::status;
-use crate::net::client::{connect, NetError};
+use crate::net::client::{connect, CallClass, NetError};
 use crate::net::ipc::LOCAL_NODE_URL;
 use crate::net::socks::{Isolation, ProxyAddr};
 use crate::network::ZNetwork;
@@ -57,8 +57,8 @@ pub fn judge(net: ZNetwork, node_tip: u32, server_tip: u32, same_block: bool) ->
 
 /// Both tips, then both tree states at the lower one, whose block hashes must match.
 pub async fn check(net: ZNetwork, server: &str, proxy: &ProxyAddr) -> Result<CrossCheck, NetError> {
-    let mut node = connect(LOCAL_NODE_URL, proxy, Isolation::fresh()).await?;
-    let mut remote = connect(server, proxy, Isolation::fresh()).await?;
+    let mut remote = connect(server, proxy, CallClass::Tip, Isolation::fresh()).await?;
+    let mut node = connect(LOCAL_NODE_URL, proxy, CallClass::Tip, Isolation::fresh()).await?;
     let node_tip = node.get_latest_block(ChainSpec {}).await.map_err(status(LOCAL_NODE_URL))?.into_inner().height as u32;
     let server_tip = remote.get_latest_block(ChainSpec {}).await.map_err(status(server))?.into_inner().height as u32;
     let lower = node_tip.min(server_tip);

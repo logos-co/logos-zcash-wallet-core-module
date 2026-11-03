@@ -13,6 +13,8 @@ use rand::RngExt;
 use tokio::net::TcpStream;
 use tokio_socks::tcp::Socks5Stream;
 
+use super::client::CallClass;
+
 /// The proxy URL scheme we accept. Plain socks5 resolves names locally and http
 /// proxies cannot isolate circuits, so both are refused.
 pub const SCHEME: &str = "socks5h://";
@@ -23,12 +25,14 @@ pub struct ProxyAddr {
     pub port: u16,
     /// Servers that go around the proxy: the user chose to reach them without Tor.
     pub bypass: Arc<BTreeSet<String>>,
+    /// Classes of call that go around it, onion services excepted.
+    pub direct_for: Arc<BTreeSet<CallClass>>,
 }
 
 impl ProxyAddr {
     /// No proxy: nothing on the routes goes through Tor.
     pub fn direct() -> Self {
-        Self { host: "direct".into(), port: 0, bypass: Arc::default() }
+        Self { host: "direct".into(), port: 0, bypass: Arc::default(), direct_for: Arc::default() }
     }
 
     pub fn is_direct(&self) -> bool {
@@ -37,7 +41,7 @@ impl ProxyAddr {
 
     /// The built-in Tor, reached over Logos IPC rather than a port.
     pub fn tor() -> Self {
-        Self { host: "tor".into(), port: 0, bypass: Arc::default() }
+        Self { host: "tor".into(), port: 0, bypass: Arc::default(), direct_for: Arc::default() }
     }
 
     pub fn is_tor(&self) -> bool {
@@ -51,6 +55,20 @@ impl ProxyAddr {
 
     pub fn bypasses(&self, server: &str) -> bool {
         self.bypass.contains(server)
+    }
+
+    pub fn direct_for(mut self, classes: impl IntoIterator<Item = CallClass>) -> Self {
+        self.direct_for = Arc::new(classes.into_iter().collect());
+        self
+    }
+
+    pub fn dials_directly(&self, class: CallClass) -> bool {
+        self.direct_for.contains(&class)
+    }
+
+    /// Some calls go direct and the rest through Tor: Tor for what identifies you.
+    pub fn splits(&self) -> bool {
+        !self.direct_for.is_empty() && !self.is_direct()
     }
 
     /// `tor`, the built-in Tor, or the user's own as socks5h://host:port.
@@ -69,7 +87,7 @@ impl ProxyAddr {
         if host.is_empty() {
             return Err("proxy needs a host".into());
         }
-        Ok(Self { host: host.trim_matches(['[', ']']).to_string(), port, bypass: Arc::default() })
+        Ok(Self { host: host.trim_matches(['[', ']']).to_string(), port, bypass: Arc::default(), direct_for: Arc::default() })
     }
 }
 
@@ -148,7 +166,7 @@ mod tests {
     fn proxy_urls() {
         assert_eq!(
             ProxyAddr::parse("socks5h://127.0.0.1:9050").unwrap(),
-            ProxyAddr { host: "127.0.0.1".into(), port: 9050, bypass: Arc::default() }
+            ProxyAddr { host: "127.0.0.1".into(), port: 9050, bypass: Arc::default(), direct_for: Arc::default() }
         );
         assert!(ProxyAddr::parse("socks5://127.0.0.1:9050").is_err());
         assert!(ProxyAddr::parse("http://127.0.0.1:8118").is_err());

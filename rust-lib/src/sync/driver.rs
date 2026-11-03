@@ -6,7 +6,6 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use futures_util::TryStreamExt;
 use serde::Serialize;
 use zcash_client_backend::data_api::chain::{error::Error as ChainError, scan_cached_blocks, ChainState, CommitmentTreeRoot};
 use zcash_client_backend::data_api::scanning::ScanPriority;
@@ -16,7 +15,7 @@ use zcash_client_backend::data_api::{
     SAPLING_SHARD_HEIGHT,
 };
 use zcash_client_backend::proto::compact_formats::CompactBlock;
-use zcash_client_backend::proto::service::{GetSubtreeRootsArg, LightdInfo, ShieldedProtocol};
+use zcash_client_backend::proto::service::{LightdInfo, ShieldedProtocol};
 use zcash_keys::encoding::AddressCodec;
 use zcash_primitives::merkle_tree::HashSer;
 use zcash_primitives::transaction::Transaction;
@@ -28,7 +27,7 @@ use super::crosscheck::{self, CrossCheck, Verdict};
 use super::enhance::{self, Fetched};
 use super::fetch::{self, Chunk};
 use super::frontier::{self, FrontierError};
-use crate::net::client::{connect, NetError};
+use crate::net::client::{CallClass, NetError};
 use crate::net::ipc::LOCAL_NODE_URL;
 use crate::net::socks::{Isolation, ProxyAddr};
 use crate::network::ZNetwork;
@@ -59,6 +58,9 @@ pub struct SyncConfig {
     pub servers: Vec<String>,
     /// Where transactions go out; the sync servers unless the routes say otherwise.
     pub broadcast: Vec<String>,
+    /// Where transactions are looked up by txid, and by transparent address.
+    pub details: Vec<String>,
+    pub taddr: Vec<String>,
     pub parallel: usize,
     /// Cached chunks not yet scanned, plus downloads in flight, stay under this.
     pub ahead: usize,
@@ -69,8 +71,8 @@ pub struct SyncConfig {
 
 impl SyncConfig {
     pub fn new(proxy: ProxyAddr, servers: Vec<String>) -> Self {
-        let broadcast = servers.clone();
-        Self { proxy, servers, broadcast, parallel: 2, ahead: 24, work_cap: 2_000, tip_poll: Duration::from_secs(30) }
+        let (broadcast, details, taddr) = (servers.clone(), servers.clone(), servers.clone());
+        Self { proxy, servers, broadcast, details, taddr, parallel: 2, ahead: 24, work_cap: 2_000, tip_poll: Duration::from_secs(30) }
     }
 }
 
@@ -561,19 +563,7 @@ impl Syncer {
         let (server, proxy) = (self.cfg.servers[0].clone(), self.cfg.proxy.clone());
         let fetch = |p: ShieldedProtocol, start: u64| {
             let (server, proxy) = (server.clone(), proxy.clone());
-            async move {
-                let mut c = connect(&server, &proxy, Isolation::fresh()).await?;
-                let arg = GetSubtreeRootsArg { start_index: start as u32, shielded_protocol: p as i32, max_entries: 0 };
-                let roots: Vec<_> = c
-                    .get_subtree_roots(arg)
-                    .await
-                    .map_err(|status| NetError::Status { server: server.clone(), status })?
-                    .into_inner()
-                    .try_collect()
-                    .await
-                    .map_err(|status| NetError::Status { server: server.clone(), status })?;
-                Ok::<_, NetError>(roots)
-            }
+            async move { fetch::subtree_roots(&server, &proxy, p as i32, start as u32).await }
         };
         fn parse<H: HashSer>(roots: Vec<zcash_client_backend::proto::service::SubtreeRoot>) -> Result<Vec<CommitmentTreeRoot<H>>, String> {
             roots
@@ -726,12 +716,19 @@ impl Syncer {
             if self.enh_in_flight.contains(&req) || (!local && enhance::not_before(&req).is_some_and(|t| t > now)) {
                 continue;
             }
+            let servers = match enhance::class(&req) {
+                CallClass::Taddr => &self.cfg.taddr,
+                _ => &self.cfg.details,
+            };
+            if servers.is_empty() {
+                continue;
+            }
             self.enh_in_flight.insert(req.clone());
-            let server = enhance::pick(&self.cfg.servers).to_string();
+            let server = enhance::pick(servers).to_string();
             let (proxy, tx, params) = (self.cfg.proxy.clone(), self.tx.clone(), self.params);
             self.rt.spawn(async move {
                 if !local {
-                    tokio::time::sleep(enhance::random_delay()).await;
+                    tokio::time::sleep(enhance::delay(proxy.splits())).await;
                 }
                 let r = enhance::fetch(params, &server, &proxy, &req, tip).await;
                 let _ = tx.send(Msg::Enhanced(req, r));
