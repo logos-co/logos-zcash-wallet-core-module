@@ -1,5 +1,6 @@
-//! Reading from the local node, a server checks it: at the lower of their two tips, both must
-//! have the same block. A node fed a false chain fails this; one that is only behind does not.
+//! Another operator's server checks the chain the wallet reads, the local node's or the sync
+//! server's: at the lower of their two tips, both must have the same block. A source fed a false
+//! chain fails this; one that is only behind does not.
 
 use serde::Serialize;
 use zcash_client_backend::proto::service::{BlockId, ChainSpec};
@@ -7,7 +8,6 @@ use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 use super::fetch::status;
 use crate::net::client::{connect, CallClass, NetError};
-use crate::net::ipc::LOCAL_NODE_URL;
 use crate::net::socks::{Isolation, ProxyAddr};
 use crate::network::ZNetwork;
 
@@ -27,7 +27,10 @@ pub enum Verdict {
 #[serde(rename_all = "camelCase")]
 pub struct CrossCheck {
     pub verdict: Verdict,
+    /// What was checked: the local node, or the server tips come from.
+    pub reference: String,
     pub server: String,
+    /// The reference's tip.
     pub node_tip: u32,
     pub server_tip: u32,
     /// Unix seconds.
@@ -55,23 +58,25 @@ pub fn judge(net: ZNetwork, node_tip: u32, server_tip: u32, same_block: bool) ->
     }
 }
 
-/// Both tips, then both tree states at the lower one, whose block hashes must match.
-pub async fn check(net: ZNetwork, server: &str, proxy: &ProxyAddr) -> Result<CrossCheck, NetError> {
-    let mut remote = connect(server, proxy, CallClass::Tip, Isolation::fresh()).await?;
-    let mut node = connect(LOCAL_NODE_URL, proxy, CallClass::Tip, Isolation::fresh()).await?;
-    let node_tip = node.get_latest_block(ChainSpec {}).await.map_err(status(LOCAL_NODE_URL))?.into_inner().height as u32;
+/// Both tips, then both tree states at the lower one, whose block hashes must match. `reference`
+/// is read as tips are; `server` as a `check` call, through Tor unless the user set it without.
+pub async fn check(net: ZNetwork, reference: &str, server: &str, proxy: &ProxyAddr) -> Result<CrossCheck, NetError> {
+    let mut remote = connect(server, proxy, CallClass::Check, Isolation::fresh()).await?;
+    let mut node = connect(reference, proxy, CallClass::Tip, Isolation::fresh()).await?;
+    let node_tip = node.get_latest_block(ChainSpec {}).await.map_err(status(reference))?.into_inner().height as u32;
     let server_tip = remote.get_latest_block(ChainSpec {}).await.map_err(status(server))?.into_inner().height as u32;
     let lower = node_tip.min(server_tip);
     // lightwalletd serves no tree state below Sapling, where the wallet has nothing to read.
     let sapling = net.activation_height(NetworkUpgrade::Sapling).map_or(1, u32::from).max(1);
     let same_block = lower < sapling || {
         let at = BlockId { height: lower as u64, hash: vec![] };
-        let a = node.get_tree_state(at.clone()).await.map_err(status(LOCAL_NODE_URL))?.into_inner().hash;
+        let a = node.get_tree_state(at.clone()).await.map_err(status(reference))?.into_inner().hash;
         let b = remote.get_tree_state(at).await.map_err(status(server))?.into_inner().hash;
         !a.is_empty() && a.eq_ignore_ascii_case(&b)
     };
     let checked_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    Ok(CrossCheck { verdict: judge(net, node_tip, server_tip, same_block), server: server.into(), node_tip, server_tip, checked_at })
+    let verdict = judge(net, node_tip, server_tip, same_block);
+    Ok(CrossCheck { verdict, reference: reference.into(), server: server.into(), node_tip, server_tip, checked_at })
 }
 
 #[cfg(test)]
