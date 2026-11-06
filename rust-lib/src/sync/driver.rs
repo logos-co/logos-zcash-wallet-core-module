@@ -54,13 +54,17 @@ fn holds(old: u32, new: u32, scanned: Option<u32>) -> bool {
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     pub proxy: ProxyAddr,
-    /// Chunks go to these servers in turn; the first also answers tip queries.
+    /// Chunks go to these servers in turn. Tips and subtree roots come from one of them, the next
+    /// after a failure.
     pub servers: Vec<String>,
     /// Where transactions go out; the sync servers unless the routes say otherwise.
     pub broadcast: Vec<String>,
     /// Where transactions are looked up by txid, and by transparent address.
     pub details: Vec<String>,
     pub taddr: Vec<String>,
+    /// Other operators' servers that take turns checking the chain read: the local node's, or with
+    /// sync split from lookups, the sync operator's.
+    pub checkers: Vec<String>,
     pub parallel: usize,
     /// Cached chunks not yet scanned, plus downloads in flight, stay under this.
     pub ahead: usize,
@@ -72,7 +76,7 @@ pub struct SyncConfig {
 impl SyncConfig {
     pub fn new(proxy: ProxyAddr, servers: Vec<String>) -> Self {
         let (broadcast, details, taddr) = (servers.clone(), servers.clone(), servers.clone());
-        Self { proxy, servers, broadcast, details, taddr, parallel: 2, ahead: 24, work_cap: 2_000, tip_poll: Duration::from_secs(30) }
+        Self { proxy, servers, broadcast, details, taddr, checkers: vec![], parallel: 2, ahead: 24, work_cap: 2_000, tip_poll: Duration::from_secs(30) }
     }
 }
 
@@ -109,7 +113,8 @@ pub struct Progress {
     pub blocks_left: Option<u64>,
     pub chunks_cached: usize,
     pub last_error: Option<String>,
-    /// Reading from the local node: how it compared with a server last time.
+    /// How the chain read (the local node's, or the sync server's) compared with another
+    /// operator's server last time.
     pub cross_check: Option<CrossCheck>,
 }
 
@@ -127,7 +132,8 @@ enum Msg {
     Chunk(u32, Result<Chunk, NetError>),
     /// A cached chunk's missing blocks: chunk start, first height, result.
     Tail(u32, u32, Result<Vec<CompactBlock>, NetError>),
-    Tip(Result<(u32, LightdInfo), NetError>),
+    /// The server asked, and its answer.
+    Tip(String, Result<(u32, LightdInfo), NetError>),
     Enhanced(TransactionDataRequest, Result<Fetched, NetError>),
     /// Local node only: an address's transactions up to a height.
     Received(TransparentAddress, u32, Result<Vec<(Transaction, Option<BlockHeight>)>, NetError>),
@@ -149,6 +155,39 @@ pub enum ErrorSource {
     Migration,
     /// The local node against a server.
     CrossCheck,
+}
+
+type Roots<H> = Vec<CommitmentTreeRoot<H>>;
+type OrchardHash = orchard::tree::MerkleHashOrchard;
+
+/// Which server tips and subtree roots come from: the same one while it answers, the next after a
+/// failure, at once until each has had its turn since the last answer.
+#[derive(Debug, Default)]
+struct TipSource {
+    at: usize,
+    failed: usize,
+}
+
+impl TipSource {
+    fn server<'a>(&self, servers: &'a [String]) -> &'a str {
+        &servers[self.at % servers.len()]
+    }
+
+    /// The servers from this one on, each once.
+    fn in_turn<'a>(&self, servers: &'a [String]) -> impl Iterator<Item = &'a String> {
+        servers.iter().cycle().skip(self.at % servers.len()).take(servers.len())
+    }
+
+    /// Moves on after a failure; whether to ask the next one now.
+    fn failed(&mut self, servers: usize) -> bool {
+        self.at += 1;
+        self.failed += 1;
+        self.failed < servers
+    }
+
+    fn answered(&mut self) {
+        self.failed = 0;
+    }
 }
 
 /// Errors by source, so the one shown is the newest that still stands.
@@ -195,6 +234,7 @@ pub struct Syncer {
     tails_in_flight: BTreeSet<u32>,
     tip_in_flight: bool,
     last_tip_poll: Option<Instant>,
+    tip_source: TipSource,
     tip: Option<u32>,
     /// A newer tip held back while its blocks download, and since when.
     held: Option<(u32, Instant)>,
@@ -215,7 +255,7 @@ pub struct Syncer {
     t_pause: Option<Instant>,
     /// When scanning began this session, and how many blocks since, for the ETA.
     pace: Option<(Instant, u64)>,
-    /// Local node only: the next cross-check, the server it goes to, and a first mismatch.
+    /// The next cross-check, the server it goes to, and a first mismatch.
     check_due: Option<Instant>,
     check_in_flight: bool,
     next_checker: usize,
@@ -250,6 +290,7 @@ impl Syncer {
             tails_in_flight: BTreeSet::new(),
             tip_in_flight: false,
             last_tip_poll: None,
+            tip_source: TipSource::default(),
             tip: None,
             held: None,
             roots: None,
@@ -342,9 +383,10 @@ impl Syncer {
         }
         self.tip_in_flight = true;
         self.last_tip_poll = Some(Instant::now());
-        let (server, proxy, tx) = (self.cfg.servers[0].clone(), self.cfg.proxy.clone(), self.tx.clone());
+        let (server, proxy, tx) = (self.tip_source.server(&self.cfg.servers).to_string(), self.cfg.proxy.clone(), self.tx.clone());
         self.rt.spawn(async move {
-            let _ = tx.send(Msg::Tip(fetch::tip_and_info(&server, &proxy, Isolation::fresh()).await));
+            let r = fetch::tip_and_info(&server, &proxy, Isolation::fresh()).await;
+            let _ = tx.send(Msg::Tip(server, r));
         });
     }
 
@@ -395,39 +437,44 @@ impl Syncer {
         Ok(())
     }
 
-    /// Reading from the local node, the servers that send transactions take turns checking it.
+    /// Other operators' servers take turns checking the chain read: the local node's, or the one
+    /// tips come from.
     fn cross_check_if_due(&mut self) {
-        let checkers: Vec<String> = self.cfg.broadcast.iter().filter(|s| *s != LOCAL_NODE_URL).cloned().collect();
-        if !self.local() || checkers.is_empty() || self.check_in_flight || self.check_due.is_some_and(|t| Instant::now() < t) {
+        let checkers = &self.cfg.checkers;
+        if checkers.is_empty() || self.check_in_flight || self.check_due.is_some_and(|t| Instant::now() < t) {
             return;
         }
         let server = checkers[self.next_checker % checkers.len()].clone();
+        let reference = self.tip_source.server(&self.cfg.servers).to_string();
         self.next_checker += 1;
         self.check_in_flight = true;
         self.check_due = Some(Instant::now() + CROSS_CHECK_EVERY);
         let (proxy, tx, net) = (self.cfg.proxy.clone(), self.tx.clone(), self.params);
         self.rt.spawn(async move {
-            let _ = tx.send(Msg::CrossCheck(crosscheck::check(net, &server, &proxy).await));
+            let _ = tx.send(Msg::CrossCheck(crosscheck::check(net, &reference, &server, &proxy).await));
         });
     }
 
     fn handle(&mut self, db: &mut Db, msg: Msg) -> Result<(), SyncError> {
         match msg {
-            Msg::Tip(r) => {
+            Msg::Tip(server, r) => {
                 self.tip_in_flight = false;
                 match r {
                     Ok((tip, info)) => {
                         // Under the tip's source too, so it stays shown while every poll gives it.
-                        if let Err(e) = self.check_server(&self.cfg.servers[0].clone(), &info, tip) {
+                        if let Err(e) = self.check_server(&server, &info, tip) {
                             self.fail(ErrorSource::Tip, &e);
+                            self.tip_failed();
                             return Err(e);
                         }
+                        self.tip_source.answered();
                         self.take_tip(db, tip)?;
                         self.succeed(ErrorSource::Tip);
                     }
                     Err(e) => {
                         tracing::warn!(target: "zcash", "tip poll: {e}");
                         self.fail(ErrorSource::Tip, e);
+                        self.tip_failed();
                     }
                 }
             }
@@ -489,7 +536,8 @@ impl Syncer {
                         self.differed = c.verdict == Verdict::Differs;
                         if self.differed {
                             let at = c.node_tip.min(c.server_tip);
-                            self.fail(ErrorSource::CrossCheck, format!("your node and {} have different blocks at {at}: one of them is on a false chain", c.server));
+                            let read = if c.reference == LOCAL_NODE_URL { "your node".to_string() } else { c.reference.clone() };
+                            self.fail(ErrorSource::CrossCheck, format!("{read} and {} have different blocks at {at}: one of them is on a false chain", c.server));
                         } else {
                             self.succeed(ErrorSource::CrossCheck);
                         }
@@ -517,6 +565,13 @@ impl Syncer {
             }
         }
         Ok(())
+    }
+
+    /// The next server answers tips, at once while one has yet to fail since the last answer.
+    fn tip_failed(&mut self) {
+        if self.tip_source.failed(self.cfg.servers.len()) {
+            self.last_tip_poll = None;
+        }
     }
 
     fn check_server(&self, server: &str, info: &LightdInfo, tip: u32) -> Result<(), SyncError> {
@@ -558,9 +613,30 @@ impl Syncer {
         Ok(())
     }
 
-    /// Loads the subtree roots completed since `from`, per pool, and returns how many each now has.
+    /// Loads the subtree roots completed since `from`, per pool, and returns how many each now has:
+    /// from the server tips come from, else the next that answers.
     fn load_subtree_roots(&mut self, db: &mut Db, from: [u64; 3]) -> Result<[u64; 3], SyncError> {
-        let (server, proxy) = (self.cfg.servers[0].clone(), self.cfg.proxy.clone());
+        let mut last = None;
+        for server in self.tip_source.in_turn(&self.cfg.servers).cloned().collect::<Vec<_>>() {
+            match self.subtree_roots_from(&server, from) {
+                Ok((sapling, orchard, ironwood)) => {
+                    let [s, o, i] = from;
+                    db.put_sapling_subtree_roots(s, &sapling).map_err(db_err)?;
+                    db.put_orchard_subtree_roots(o, &orchard).map_err(db_err)?;
+                    db.put_ironwood_subtree_roots(i, &ironwood).map_err(db_err)?;
+                    return Ok([s + sapling.len() as u64, o + orchard.len() as u64, i + ironwood.len() as u64]);
+                }
+                Err(e) => {
+                    tracing::warn!(target: "zcash", "subtree roots: {e}");
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.expect("at least one server"))
+    }
+
+    fn subtree_roots_from(&self, server: &str, from: [u64; 3]) -> Result<(Roots<sapling::Node>, Roots<OrchardHash>, Roots<OrchardHash>), SyncError> {
+        let (server, proxy) = (server.to_string(), self.cfg.proxy.clone());
         let fetch = |p: ShieldedProtocol, start: u64| {
             let (server, proxy) = (server.clone(), proxy.clone());
             async move { fetch::subtree_roots(&server, &proxy, p as i32, start as u32).await }
@@ -579,10 +655,7 @@ impl Syncer {
         let sapling = parse::<sapling::Node>(self.rt.block_on(fetch(ShieldedProtocol::Sapling, s))?).map_err(bad)?;
         let orchard = parse::<orchard::tree::MerkleHashOrchard>(self.rt.block_on(fetch(ShieldedProtocol::Orchard, o))?).map_err(bad)?;
         let ironwood = parse::<orchard::tree::MerkleHashOrchard>(self.rt.block_on(fetch(ShieldedProtocol::Ironwood, i))?).map_err(bad)?;
-        db.put_sapling_subtree_roots(s, &sapling).map_err(db_err)?;
-        db.put_orchard_subtree_roots(o, &orchard).map_err(db_err)?;
-        db.put_ironwood_subtree_roots(i, &ironwood).map_err(db_err)?;
-        Ok([s + sapling.len() as u64, o + orchard.len() as u64, i + ironwood.len() as u64])
+        Ok((sapling, orchard, ironwood))
     }
 
     /// The wallet database refuses a gap between shards. A window that starts in a shard past
@@ -950,6 +1023,22 @@ mod tests {
         e.set(ErrorSource::Scan, "chain changed".into());
         e.clear_moot();
         assert_eq!(e.latest().as_deref(), Some("migration: no server"));
+    }
+
+    #[test]
+    fn tips_move_to_the_next_server_after_a_failure() {
+        let servers: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        let mut t = TipSource::default();
+        assert_eq!(t.server(&servers), "a");
+        assert!(t.failed(3), "b is asked at once");
+        assert!(t.failed(3), "and c");
+        assert!(!t.failed(3), "each had its turn: a waits for the next poll");
+        assert_eq!(t.server(&servers), "a");
+        t.answered();
+        assert_eq!(t.server(&servers), "a", "the one that answers keeps the tips");
+        assert!(t.failed(3));
+        assert_eq!(t.in_turn(&servers).collect::<Vec<_>>(), ["b", "c", "a"], "roots from the tip's server first");
+        assert!(!TipSource::default().failed(1), "one server: the next poll asks it again");
     }
 
     #[test]

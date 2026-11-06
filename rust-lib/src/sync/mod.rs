@@ -37,8 +37,9 @@ mod classes {
         assert!(super::fetch::subtree_roots(SERVER, &p, 1, 0).await.is_err());
         assert_eq!(classes(), [Sync, Sync, Sync, Sync]);
         assert!(super::fetch::tip_and_info(SERVER, &p, Isolation::fresh()).await.is_err());
-        assert!(super::crosscheck::check(net, SERVER, &p).await.is_err());
-        assert_eq!(classes(), [Tip, Tip]);
+        // The checker is dialled first, as a `check` call: never direct by class.
+        assert!(super::crosscheck::check(net, SERVER, SERVER, &p).await.is_err());
+        assert_eq!(classes(), [Tip, Check]);
         let txid = TxId::from_bytes([7; 32]);
         for req in [TransactionDataRequest::GetStatus(txid), TransactionDataRequest::Enhancement(txid)] {
             assert!(super::enhance::fetch(net, SERVER, &p, &req, 1).await.is_err());
