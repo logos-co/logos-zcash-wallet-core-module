@@ -49,7 +49,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 pub enum CallClass {
     /// Compact blocks, tree states and subtree roots.
     Sync,
-    /// Tips and server info, and the local node's cross-check.
+    /// Tips and server info, and the cross-check's read of the chain the wallet syncs from.
     Tip,
     /// GetTransaction by txid.
     Details,
@@ -58,6 +58,9 @@ pub enum CallClass {
     /// SendTransaction, and asking another operator whether it has the transaction.
     Broadcast,
     Mempool,
+    /// The core's own: another operator's tip and tree state, checking the chain the wallet reads.
+    /// Never direct by class, so that operator can't tie it to the IP that syncs.
+    Check,
 }
 
 /// How a call reaches its server.
@@ -318,7 +321,7 @@ mod tests {
             assert_eq!(path(rocks, &split, class), Path::Direct, "{class:?}");
             assert_eq!(path(&onion, &split, class), Path::Tor, "an onion service takes Tor for {class:?}");
         }
-        for class in [CallClass::Details, CallClass::Taddr, CallClass::Broadcast, CallClass::Mempool] {
+        for class in [CallClass::Details, CallClass::Taddr, CallClass::Broadcast, CallClass::Mempool, CallClass::Check] {
             assert_eq!(path(rocks, &split, class), Path::Tor, "{class:?}");
             assert_eq!(path(lan, &split, class), Path::Lan, "{class:?}");
         }

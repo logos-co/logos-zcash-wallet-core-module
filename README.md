@@ -38,16 +38,24 @@ which holds the roles; this module holds the keys.
   (`sync::frontier`). Each chunk must continue the tree state below it and lead to the one
   above. Scan calls are capped at about 2,000 shielded outputs, so a stop request is honoured
   within a second. The tip is polled every 30 s, and each of a poll's calls gives up after
-  60 s.
+  60 s. Tips, a new wallet's tree state and subtree roots come from one sync server while it
+  answers; after a failure the next one is asked, at once until each has had its turn.
+- **Cross-check.** Another operator's servers take turns, every 2 minutes, comparing the block
+  at the lower of two tips with the chain the wallet reads: the local node's, or with sync
+  split from lookups, the sync server's. Two mismatches in a row set `lastError`; `crossCheck`
+  in `sync_status` holds the last result.
 - **Use Tor for what identifies you.** Each call has a class: `sync` (compact blocks, tree
-  states, subtree roots), `tip` (tips, server info, the local node's cross-check), `details`
-  (a transaction by txid), `taddr` (transactions by transparent address), `broadcast` (sends,
-  and asking another operator whether it has one) and `mempool`. The classes in the routes'
+  states, subtree roots), `tip` (tips, server info, the cross-check's read of the chain the
+  wallet syncs from), `details` (a transaction by txid), `taddr` (transactions by transparent
+  address), `broadcast` (sends, and asking another operator whether it has one) and `mempool`.
+  The core's own `check` class reads the cross-checking operator and is never direct by class.
+  The classes in the routes'
   `directFor` (`sync` and `tip`, never more) dial directly, onion services excepted; the rest
   take the proxy. With another operator in the routes, sync and tips stay with the first
   server's operator, `details` and `taddr` lookups go to the others, and sends try the others
   first, so the operator that sees this IP download blocks never sees what the wallet looks
-  up. Each lookup then also waits up to 60 s more, on top of the usual 0-20 s, so its timing
+  up. The others also check its chain, and no fallback dials them directly: with one sync
+  server, tips have none. Each lookup then also waits up to 60 s more, on top of the usual 0-20 s, so its timing
   is harder to match to a direct download. The local node keeps all of this as before: it
   serves every read itself.
 - **Restore without a lookup.** Restores start from a bundled checkpoint
@@ -56,7 +64,10 @@ which holds the roles; this module holds the keys.
 - **Sends.** A proposal spends from one shielded pool at a time, Ironwood first; using
   several pools needs explicit consent (ZIP 315). Approval decrypts the phrase, proves
   with Sapling parameters checked against `zcash_proofs`' hashes, signs with an explicit,
-  NU7-aware expiry, and broadcasts each transaction on a fresh circuit.
+  NU7-aware expiry, and broadcasts each transaction on a fresh circuit. Within two minutes
+  another broadcast server must know it, else it is sent there too; with only one, the local
+  node is asked when it syncs the wallet, and the payment goes back to that server, never
+  through the node.
 - **Shielding.** One transparent address per transaction, never several (ZIP 315),
   offered above 0.001 ZEC.
 
@@ -148,8 +159,9 @@ coinbase to the end. Mining to a transparent address
 `https://lwd-a.test` and `https://lwd-b.test`, behind counting fronts (the `test-dial` feature,
 off in every build but this test's, dials them in plain HTTP/2), with stand-ins for tor_module
 and the local node. With Tor for what identifies you, no lookup or send goes direct, and the
-second operator sees nothing direct; with Tor for nothing, tor_module is never called; with the
-local node, every read stays on it.
+second operator sees nothing direct and checks the first's chain over Tor; with Tor for nothing,
+tor_module is never called; with the local node, every read stays on it and the cross-check
+goes over Tor.
 
 ```bash
 REGTEST_HEIGHTS=../tools/regtest/regtest.json REGTEST_PHRASE=phrase.txt \

@@ -1,5 +1,6 @@
 //! Where each call class goes, against a local regtest chain from tools/regtest/chain.sh. Two
 //! operators sit behind counting fronts; stand-ins for tor_module and the local node count too.
+//! The cross-check reads the other operator through Tor in every mode.
 //!
 //! REGTEST_HEIGHTS=../tools/regtest/regtest.json REGTEST_PHRASE=phrase.txt REGTEST_RPC=http://127.0.0.1:28232 \
 //! REGTEST_SERVERS=http://127.0.0.1:29061,http://127.0.0.1:29063 ZCASH_PARAMS_DIR=... \
@@ -32,6 +33,8 @@ const B: &str = "https://lwd-b.test:443";
 /// The calls that name the wallet: lookups by txid or address, and sends.
 const IDENTIFYING: [&str; 3] = ["GetTransaction", "GetTaddressTransactions", "SendTransaction"];
 const SYNC: [&str; 3] = ["GetBlockRange", "GetTreeState", "GetSubtreeRoots"];
+/// The cross-check: a tip, then a tree state at the lower of the two.
+const CHECK: [&str; 2] = ["GetLatestBlock", "GetTreeState"];
 
 /// The methods one place saw, as "<operator> <method>" or just "<method>".
 #[derive(Clone, Default)]
@@ -283,6 +286,7 @@ fn each_class_takes_its_path_on_regtest() {
     w.send();
     // Lookups go to B; A's GetTransaction over Tor is the check that it saw the send.
     let looked_up = wait_for(&[&tor], &["lwd-b.test GetTransaction", "lwd-b.test GetTaddressTransactions"], lookups);
+    let checked = wait_for(&[&tor], &["lwd-b.test GetTreeState"], Duration::from_secs(60));
     drop(w);
     let (da, db, t) = (direct_a.take(), direct_b.take(), tor.take());
     println!("identifying: direct A {da:?}\ndirect B {db:?}\ntor {t:?}");
@@ -290,7 +294,10 @@ fn each_class_takes_its_path_on_regtest() {
     assert!(!has(&da, &SYNC).is_empty(), "sync did not go direct: {da:?}");
     assert_eq!(has(&da, &IDENTIFYING), Vec::<String>::new(), "a call that names the wallet went direct");
     assert_eq!(db, Vec::<String>::new(), "sync used one operator; the other saw this IP");
-    assert_eq!(has(&t, &SYNC), Vec::<String>::new(), "sync went over Tor");
+    // B checks A's chain over Tor: its tree state at the lower tip is the only sync-class read there.
+    assert!(checked, "B never checked A's chain: {t:?}");
+    let sync_over_tor: Vec<String> = has(&t, &SYNC).into_iter().filter(|s| s != "lwd-b.test GetTreeState").collect();
+    assert_eq!(sync_over_tor, Vec::<String>::new(), "sync went over Tor");
     let at_a: Vec<&String> = t.iter().filter(|s| s.as_str() == "lwd-a.test GetTaddressTransactions").collect();
     assert!(at_a.is_empty(), "an address lookup went to the sync operator: {at_a:?}");
     assert!(t.iter().any(|s| s == "lwd-b.test SendTransaction"), "the send did not try the other operator first: {t:?}");
@@ -306,8 +313,8 @@ fn each_class_takes_its_path_on_regtest() {
     assert!(looked_up, "no lookup went out");
     assert_eq!(t, Vec::<String>::new(), "a call went to tor_module with Tor off");
 
-    // The local node keeps every read; the send leaves it over Tor, and the tip cross-check
-    // (a tip, then a tree state at it) goes direct as a `tip` call.
+    // The local node keeps every read; the send leaves it over Tor, and so does the cross-check,
+    // a `check` call, whatever directFor says.
     clear(&[&direct_a, &direct_b, &tor, &node]);
     let w = Wallet::restore(
         json!({"proxy": "tor", "servers": [LOCAL_NODE_URL], "broadcast": [A, B], "directFor": ["sync", "tip"],
@@ -320,9 +327,10 @@ fn each_class_takes_its_path_on_regtest() {
     let (da, db, t, n) = (direct_a.take(), direct_b.take(), tor.take(), node.take());
     println!("local node: node {n:?}\ndirect A {da:?}\ndirect B {db:?}\ntor {t:?}");
     assert!(looked_up && !has(&n, &SYNC).is_empty(), "the node did not serve the reads: {n:?}");
-    let cross_check = ["GetLatestBlock", "GetTreeState"];
-    let direct: Vec<&String> = da.iter().chain(&db).filter(|s| !cross_check.contains(&s.as_str())).collect();
-    assert!(direct.is_empty(), "a read left the local node directly: {direct:?}");
-    let reads: Vec<&String> = t.iter().filter(|s| !s.ends_with("SendTransaction") && !s.ends_with("GetTransaction")).collect();
+    let direct: Vec<&String> = da.iter().chain(&db).collect();
+    assert!(direct.is_empty(), "a call left this computer directly: {direct:?}");
+    let reads: Vec<&String> =
+        t.iter().filter(|s| !s.ends_with("SendTransaction") && !s.ends_with("GetTransaction") && !CHECK.iter().any(|m| s.ends_with(m))).collect();
     assert!(reads.is_empty(), "a read left the local node over Tor: {reads:?}");
+    assert!(t.iter().any(|s| s.ends_with("GetLatestBlock")), "no server checked the node: {t:?}");
 }

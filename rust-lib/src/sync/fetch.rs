@@ -162,18 +162,38 @@ pub async fn subtree_roots(server: &str, proxy: &ProxyAddr, pool: i32, start: u3
     c.get_subtree_roots(arg).await.map_err(status(server))?.into_inner().try_collect().await.map_err(status(server))
 }
 
-/// After one operator accepted a transaction, the other must know it within two minutes,
-/// or it is sent there too. Returns what happened, for the log.
-pub async fn confirm_elsewhere(other: &str, proxy: &ProxyAddr, txid: Vec<u8>, raw: Vec<u8>) -> String {
+/// After one server accepted a transaction, `check` must know it within two minutes, or it is
+/// sent to `resend` (`check` itself unless that is the local node). Returns what happened, for the log.
+pub async fn confirm_elsewhere(check: &str, resend: &str, proxy: &ProxyAddr, txid: Vec<u8>, raw: Vec<u8>) -> String {
     for _ in 0..6 {
         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-        if let Ok(true) = knows_transaction(other, proxy, &txid).await {
-            return format!("{other} saw the transaction");
+        if let Ok(true) = knows_transaction(check, proxy, &txid).await {
+            return format!("{check} saw the transaction");
         }
     }
-    match send_transaction(other, proxy, raw).await {
-        Ok((0, _)) => format!("{other} had not seen it; sent there too"),
-        Ok((code, msg)) => format!("{other} refused it: {code} {msg}"),
-        Err(e) => format!("{other} unreachable: {e}"),
+    match send_transaction(resend, proxy, raw).await {
+        Ok((0, _)) => format!("{check} had not seen it; sent through {resend} again"),
+        Ok((code, msg)) => format!("{check} had not seen it; {resend} refused it: {code} {msg}"),
+        Err(e) => format!("{check} had not seen it; {resend} unreachable: {e}"),
     }
+}
+
+/// A new wallet's start: the tree state below the grid height at least `head` blocks under the
+/// tip, from the first server that answers both, in order.
+pub async fn start_state(servers: &[String], proxy: &ProxyAddr, head: u32) -> Result<TreeState, NetError> {
+    let mut last = None;
+    for server in servers {
+        let r = async {
+            let (tip, _) = tip_and_info(server, proxy, Isolation::fresh()).await?;
+            tree_state(server, proxy, super::cache::grid_floor(tip.saturating_sub(head)) - 1).await
+        };
+        match r.await {
+            Ok(state) => return Ok(state),
+            Err(e) => {
+                tracing::warn!(target: "zcash", "a new wallet's start from {server}: {e}");
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| NetError::BadUrl("no servers".into())))
 }
